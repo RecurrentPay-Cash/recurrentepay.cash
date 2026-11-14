@@ -54,6 +54,9 @@ The contract test suite passes, but it is slow (~25 min wall clock) because the 
 `MockNetworkProvider` re-evaluates the full script on every spend. Tests are run individually or
 per-file during development; a full `pnpm test` is a background job.
 
+The suite runs with a raised Jest timeout (`--testTimeout=900000`) because the default 5 s kills any
+test that spends a covenant more than once.
+
 ---
 
 ## Stack
@@ -127,9 +130,64 @@ Per the BCH BLAZE 2026 rules, work done before the event is disclosed:
 The contracts are also **unfinished** (see [Status](#status)): the implementation continues during
 the event, so the pre-work is a starting point, not a finished deliverable.
 
+### No demo of the pre-work — and why
+
+The hackathon rules ask for a demo of the disclosed pre-work. **We are not providing one, because
+the pre-work is not in a demoable state:** the two accepted design changes above are unimplemented,
+the oracle contract does not exist, and the escrow-identity gap means the funding path is not
+trustworthy. Recording a demo of a contract we already know is exploitable would misrepresent it.
+
+Instead, the **test suite is the evidence of the pre-work**. It is the honest artifact: it shows
+exactly what the contract does today, including the parts that are still wrong.
+
+```bash
+pnpm install
+pnpm --filter contracts test
+```
+
+The suite runs against CashScript's `MockNetworkProvider` — a real script evaluator, not mocks of
+the contract — and covers the state machine end to end: settlement arithmetic, the `reserved`
+matrix, n-period catch-up, the arrears rules, transfers, and the scam scenarios (supportee
+early-cancel, worker non-payment, clock-advance-while-unfunded). Every scenario is derived from
+`openspec/changes/recurrent-pay-mvp/specs/`.
+
+It is slow (~25 min wall clock) because the provider re-evaluates the full script on every spend.
+Run a single scenario while reviewing:
+
+```bash
+cd packages/contracts
+node --experimental-vm-modules ./node_modules/jest/bin/jest.js \
+  --config jest.config.mjs --testPathPattern "scam"
+```
+
+A live demo on chipnet, and the required mainnet pull, come with the hackathon work (tasks 10.1 and
+12.3) — once the contracts are worth demonstrating.
+
+---
+
+## The `bch-dev` skill
+
+This repo ships `skill/bch-dev/` — an agent skill for Bitcoin Cash development. It is a **tool meant
+to be used at this hackathon**, not part of the product.
+
+It bundles the BCH-specific knowledge that is easy to get wrong: CashScript and CashTokens, the
+Fulcrum and Chaingraph indexers, Libauth, XO Stack, Wizard Connect, and the VM/opcode changes that
+matter for covenants (VM Limits, P2S, loops, functions). `SKILL.md` is a decision-making map;
+`reference/` holds the per-tool detail.
+
+**Feel free to use it.** Two ways:
+
+- **As an agent skill** — point your agent at `skill/bch-dev/SKILL.md`. It is written to be loaded
+  when a task involves BCH contracts, wallets, or indexer setup.
+- **As documentation** — read it directly, or lift the reference files for your own project.
+
+The same goes for the **WIP contracts** in `packages/contracts/`. They are unfinished (see
+[Status](#status)), but the commitment codec, the `settle()` arithmetic, and the test harness are
+all reusable if you are building something similar. Take what is useful; check the Status section
+first so you know which parts are trustworthy.
+
 ---
 
 ## License
 
-Released into the public domain under **The Unlicense**. A `LICENSE` file is still to be added with
-the monorepo bootstrap (task 6.2).
+Released into the public domain under **The Unlicense**. See `LICENSE`.
