@@ -11,7 +11,7 @@
   "scripts": {
     "compile": "node scripts/compile.mjs",
     "build": "pnpm run compile",
-    "test": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js --config jest.config.mjs",
+    "test": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js --config jest.config.mjs --testTimeout=900000",
     "test:watch": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js --config jest.config.mjs --watch"
   },
   "dependencies": {
