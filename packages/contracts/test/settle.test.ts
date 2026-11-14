@@ -208,9 +208,9 @@ describe('n-period catch-up', () => {
   it('full catch-up after arrears reactivates the subscription', async () => {
     const sub = base({ mode: MODE_B, balance: 10n });
     sub.advance(3 * DAY);
-    await sub.pull().send(); // pays 1, leaves 2 in arrears
+    await sub.send(sub.pull()); // pays 1, leaves 2 in arrears
     sub.setBalance(20n); // fund the remaining 2 periods
-    await sub.pull().send();
+    await sub.send(sub.pull());
     const after = await sub.readCovenant();
     expect(after.state?.lastPeriodTime).toBe(T + 3 * DAY);
     expect(after.funds).toBeUndefined();

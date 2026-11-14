@@ -284,6 +284,19 @@ export class Scenario {
     this.now += seconds;
   }
 
+  /**
+   * Sends a transition and re-syncs the tracked state from the UTXO set.
+   *
+   * A successful covenant spend consumes the current state/funds UTXOs and
+   * recreates them with a new outpoint, so any later transition must be built
+   * against the fresh UTXOs. `sync()` reads the live commitment and balance back
+   * out of the provider and rebuilds them.
+   */
+  async send(tx: TransactionBuilder): Promise<void> {
+    await tx.send();
+    await this.sync();
+  }
+
   settlement(): Settlement {
     return settle(this.state, this.balance, this.now);
   }

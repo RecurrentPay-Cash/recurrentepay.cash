@@ -6,7 +6,7 @@
  * Covers tasks 4.8 (migrate), 4.10 (terms matrix), 4.11 (transfers).
  */
 import { MODE_A, MODE_B, scenario, type Scenario } from './helpers/harness.js';
-import { requireError, succeeds } from './helpers/expect.js';
+import { requireError } from './helpers/expect.js';
 
 const T = 1_764_000_000;
 const DAY = 86_400;
@@ -25,10 +25,10 @@ describe('modify (mutual consent, always-replace)', () => {
   it('a period change does not delay the next payout', async () => {
     const sub = base({ mode: MODE_B });
     sub.advance(DAY - 1); // day 6 of a 7-day period, say
-    await sub.modifyMutual(10n, 30 * DAY).send();
+    await sub.send(sub.modifyMutual(10n, 30 * DAY));
     // The boundary still uses the OLD period: a pull is due one day later.
     sub.advance(1);
-    expect(await succeeds(sub.pull())).toBe(true);
+    await sub.send(sub.pull());
     const after = await sub.readCovenant();
     // The new period applies from the following cycle.
     expect(after.state?.period).toBe(30 * DAY);
@@ -37,9 +37,9 @@ describe('modify (mutual consent, always-replace)', () => {
   it('terms promote on the next pull (unconditional replacement)', async () => {
     const sub = base({ mode: MODE_B });
     sub.advance(DAY - 1);
-    await sub.modifyMutual(20n, 2 * DAY).send();
+    await sub.send(sub.modifyMutual(20n, 2 * DAY));
     sub.advance(1);
-    await sub.pull().send();
+    await sub.send(sub.pull());
     const after = await sub.readCovenant();
     expect(after.state?.amount).toBe(20n);
     expect(after.state?.period).toBe(2 * DAY);
@@ -60,27 +60,27 @@ describe('terms matrix (mode A/B × amount/period/both)', () => {
     it(`${label}: amount change promotes on pull`, async () => {
       const sub = base({ mode });
       sub.advance(DAY - 1);
-      await sub.modifyMutual(25n, DAY).send();
+      await sub.send(sub.modifyMutual(25n, DAY));
       sub.advance(1);
-      await sub.pull().send();
+      await sub.send(sub.pull());
       expect((await sub.readCovenant()).state?.amount).toBe(25n);
     });
 
     it(`${label}: period change promotes on pull`, async () => {
       const sub = base({ mode });
       sub.advance(DAY - 1);
-      await sub.modifyMutual(10n, 3 * DAY).send();
+      await sub.send(sub.modifyMutual(10n, 3 * DAY));
       sub.advance(1);
-      await sub.pull().send();
+      await sub.send(sub.pull());
       expect((await sub.readCovenant()).state?.period).toBe(3 * DAY);
     });
 
     it(`${label}: both change promotes on pull`, async () => {
       const sub = base({ mode });
       sub.advance(DAY - 1);
-      await sub.modifyMutual(25n, 3 * DAY).send();
+      await sub.send(sub.modifyMutual(25n, 3 * DAY));
       sub.advance(1);
-      await sub.pull().send();
+      await sub.send(sub.pull());
       const after = await sub.readCovenant();
       expect(after.state?.amount).toBe(25n);
       expect(after.state?.period).toBe(3 * DAY);
