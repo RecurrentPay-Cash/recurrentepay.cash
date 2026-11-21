@@ -521,15 +521,15 @@ contract OracleSubscription(bytes32 stateCategory) {
         int retained = (owedPreSettle - gross) + DUST;
         int payout = (balance - gross) - retained;
 
-        int idx = 2;
+        int idx = 1;
         if (gross > 0) {
-            idx = 4;
+            idx = 3;
         }
-        require(stateOk(idx - 2, contractLock, stateCategory, writeState(
+        require(stateOk(idx - 1, contractLock, stateCategory, writeState(
             supporterPkh, supporteePkh, servicePkh, newAmount, amountNext,
             newPeriod, periodNext, newLastPeriodTime, mode, oraclePkHash, price
         )), "withdraw: bad state output");
-        require(tx.outputs[idx - 2].value == retained, "withdraw: bad state amount");
+        require(tx.outputs[idx - 1].value == retained, "withdraw: bad state amount");
         require(paymentOk(idx, supporterPkh, payout), "withdraw: bad payout output");
         idx = idx + 1;
         require(tailOk(idx, stateCategory, supporterPkh), "withdraw: extra outputs");
