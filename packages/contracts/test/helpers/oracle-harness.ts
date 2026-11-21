@@ -547,7 +547,11 @@ export class Scenario {
       lastPeriodTime: newAnchor,
       lastRate: Number(price),
     };
-    const contractBalance = DUST + (mode === 1 ? extraFunding : extraFunding - gppNew);
+    // `newFunds = state output value − balance`. The state output carries the
+    // fresh funding on top of the covenant's remaining balance.
+    const newFunds = extraFunding;
+    const contractBalance =
+      mode === 1 ? this.balance + newFunds : this.balance + newFunds - gppNew;
 
     const args = this.oracleArgs({ price: Number(price) });
     const tx = this.base(() => this.unlock()['reactivate']!(args.sig, args.message, args.pubkey));
@@ -564,9 +568,11 @@ export class Scenario {
       idx = idx + 1;
     }
     tx.addOutput(this.stateOutput(encodeCommitment(next), contractBalance));
-    return this.pay(tx, this.supporter);
+    // A separate fee-paying input (does not count toward `newFunds` because the
+    // contract reads `newFunds` from the state output, not from all inputs).
+    tx.addInput(this.input(funder), funder.template.unlockP2PKH());
+    return tx.addBchChangeOutputIfNeeded({ to: funder.lock, feeRate: 1 });
   }
-
   /** Canonical `migrate`: settle, then swap the oracle key. */
   migrate(
     newOracle: MockOracle,

@@ -554,30 +554,47 @@ contract OracleSubscription(bytes32 stateCategory) {
         int price = verifyOracle(oraclePkHash, lastPeriodTime, period, oracleSig, oracleMessage, oraclePubkey);
 
         int balance = tx.inputs[stateIdx].value;
-        // `newFunds` is the fresh BCH contributed in this tx beyond the covenant's
-        // own sats: the state output's value minus the covenant's input value.
-        int newFunds = tx.outputs[0].value - balance;
-
+        // `newFunds` is the fresh BCH locked into the covenant in this tx: the
+        // state output's value minus the covenant's own input value. The state
+        // output is the first output past the payments (supportee, then service).
         // Arrears gate, evaluated BEFORE any payment: paused ⟺ balance < payable.
         int gppOld = grossPerPeriod(amount, price);
         int n = (tx.locktime - lastPeriodTime) / period;
         int payable = gppOld * n;
         require(balance < payable, "reactivate: rejected while funded");
         int gppNew = grossPerPeriod(amountNext, price);
-        require(newFunds >= gppNew, "reactivate: at least one fresh period must be funded");
 
         // Pay the whole balance except DUST; the fee is carved out per period paid.
         int spendable = balance - DUST;
         int m = spendable / gppOld;
         int fee = m * perPeriodFee(gppOld);
         int prepaid = 0;
-        int contractBalance = DUST + newFunds;
         if (mode == 0) {
             fee = fee + perPeriodFee(gppNew);
             prepaid = gppNew;
-            contractBalance = DUST + newFunds - gppNew;
         }
         int supporteeAmount = spendable + prepaid - fee;
+
+        // The state output is the first output past the payments.
+        int stateOut = 0;
+        if (supporteeAmount > 0) {
+            stateOut = 1;
+        }
+        if (fee > 0) {
+            stateOut = stateOut + 1;
+        }
+        int newFunds = tx.outputs[stateOut].value - balance;
+        require(newFunds >= gppNew, "reactivate: at least one fresh period must be funded");
+
+        // The contract re-locks the whole remaining balance plus the fresh funds,
+        // minus the mode-A prepaid period.
+        int contractBalance = balance + newFunds;
+        if (mode == 0) {
+            contractBalance = balance + newFunds - gppNew;
+        }
+        // `newFunds` already folds the state output's own value, so the state
+        // amount is exactly what the builder set: balance + fresh − prepaid.
+        require(tx.outputs[stateOut].value == balance + newFunds, "reactivate: bad state amount");
 
         // Advance on the grid (waives the unpaid remainder) and promote terms.
         int newAnchor = lastPeriodTime + n * period;
@@ -593,12 +610,11 @@ contract OracleSubscription(bytes32 stateCategory) {
             require(paymentOk(idx, servicePkh, fee), "reactivate: bad service output");
             idx = idx + 1;
         }
-        require(stateOk(idx, contractLock, stateCategory, writeState(
+        require(stateOk(stateOut, contractLock, stateCategory, writeState(
             supporterPkh, supporteePkh, servicePkh, newAmount, amountNext,
             newPeriod, periodNext, newAnchor, mode, oraclePkHash, price
         )), "reactivate: bad state output");
-        require(tx.outputs[idx].value == contractBalance, "reactivate: bad state amount");
-        idx = idx + 1;
+        idx = stateOut + 1;
         require(tailOk(idx, stateCategory, supporterPkh), "reactivate: extra outputs");
     }
 
