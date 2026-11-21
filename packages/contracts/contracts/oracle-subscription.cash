@@ -1,0 +1,657 @@
+pragma cashscript ^0.14.0;
+
+// =============================================================================
+// RecurrentPay.Cash — oracle-subscription.cash
+//
+// Sources of truth (SDD):
+//   openspec/changes/recurrent-pay-mvp/design.md
+//       § Oracle coupling of `settle()` (RESOLVED)
+//       § Contract State Model
+//       § Functions — gate → settle → delta
+//       § Settlement semantics (m-period catch-up)
+//       § Arrears, pause and reactivation
+//       § Security Notes
+//   openspec/changes/recurrent-pay-mvp/specs/subscription-contract/spec.md
+//
+// -----------------------------------------------------------------------------
+// MODEL — a BCH (oracle) subscription is a SINGLE UTXO
+//
+// Unlike the token contract (two co-created UTXOs: state NFT + escrow), a BCH
+// subscription keeps the mutable state NFT and the satoshis in **one output**.
+// The settlement balance is therefore **that input's value**
+// (`tx.inputs[stateIdx].value`), never a transaction-wide sum. There is no
+// escrow to co-create, no `escrowInputIndex`, and no seed.
+//
+// DUST RESERVE (spec gap — documented here and flagged to the reviewer):
+//   A single-UTXO covenant must always leave a valid output behind, so the state
+//   output retains `DUST = 1000` sats. `spendable = balance − DUST`. This is the
+//   single-UTXO analogue of the token contract's 1-unit seed: it makes "the
+//   covenant still exists" unconditional. The spec (design.md § BCH subs are a
+//   single UTXO) says "no seed to hold" but does not name a dust floor; DUST is
+//   the minimal replacement and is kept separate from MIN_FEE_PER_PERIOD (the
+//   two share the value 1000 by coincidence).
+//
+// -----------------------------------------------------------------------------
+// COMMITMENT LAYOUT — 113 bytes (network limit: 128)
+//
+//   0..20    supporterPkh    bytes20
+//   20..40   supporteePkh    bytes20
+//   40..60   servicePkh      bytes20
+//   60..68   amount          int, 8 B LE — USD cents
+//   68..76   amountNext      int, 8 B LE — USD cents
+//   76..80   period          int, 4 B LE — seconds
+//   80..84   periodNext      int, 4 B LE
+//   84..88   lastPeriodTime  int, 4 B LE — unix seconds
+//   88..89   mode            int, 1 B    — 0 = A, 1 = B
+//   89..109  oraclePkHash    bytes20     — hash160(oraclePk)
+//   109..113 lastRate        int, 4 B LE — cents per BCH (raw GP price field)
+//
+// `amount`/`period` are the rate of the period that just ended; `amountNext`/
+// `periodNext` the upcoming rate. "Always-replace": `pull`/`reactivate` promote
+// them unconditionally. `lastRate` is initialized at creation, written by every
+// oracle-priced settle, and read-but-never-written by `cancel` and service
+// `migrate` (the dead-oracle exit/recovery paths).
+//
+// -----------------------------------------------------------------------------
+// PRICE COUPLING (design.md § Oracle coupling of `settle()`)
+//
+//   pull, reactivate, mutual migrate, withdraw → current oracle (message)
+//   cancel, service migrate                    → lastRate (no message)
+//
+// `settleOracle()` is the shared core: it converts the USD-cent `amount` to sats
+// at the given price (`grossPerPeriod = amount · 1e8 / price`) and applies the
+// same m-period catch-up as the token contract, in sats.
+//
+// -----------------------------------------------------------------------------
+// OUTPUT LAYOUT — fixed indices, `m = 0` shifts later outputs down
+//
+//   pull:      0 supportee (gross − fee), 1 service (fee), 2 state (NFT + balance − gross)
+//   cancel:    [0 supportee, 1 service] if gross > 0, then refund (balance − gross), burn NFT
+//   modify:    0 state (NFT + balance)
+//   setPkh:    0 state (NFT + balance)
+//   fund:      0 state (NFT + balance + contribution)
+//   withdraw:  [0 supportee, 1 service] if gross > 0, then state (retained), payout
+//   reactivate:[0 supportee] if > 0, [service] if fee > 0, state (NFT + contractBalance)
+//   migrate:   [0 supportee, 1 service] if gross > 0, then state (NFT + balance − gross)
+//
+// Any further output (BCH change, typically) is allowed but must carry no token,
+// except a foreign-category token routed to the supporter (see `tailOk`).
+//
+// -----------------------------------------------------------------------------
+// AUTHORISATION — `presence-always`, no signatures
+//
+// An action is authorised by an input that spends the actor's address — P2PKH
+// **or** P2SH20 of the actor's hash (mirrors the token contract).
+//
+// TIME — CashScript's `tx.time` may only appear inside `require(tx.time >= …)`;
+// the readable form is `tx.locktime`, used by the arithmetic below.
+// =============================================================================
+
+int constant COMMITMENT_SIZE = 113;
+bytes constant MUTABLE_NFT = 0x01;
+
+// Retained dust reserve (sats) — the single-UTXO analogue of the token seed.
+int constant DUST = 1000;
+// Service fee: a percent (divisor /100), charged per period paid.
+int constant SERVICE_FEE_PERCENT = 1;
+// Sats floor per period paid (the dust-limit value). Separate from DUST.
+int constant MIN_FEE_PER_PERIOD = 1000;
+// Oracle message freshness bound (seconds).
+int constant FRESHNESS = 3600;
+// Satoshis per BCH — USD-cent → sats conversion.
+int constant SATOSHIS_PER_BCH = 100000000;
+
+// -----------------------------------------------------------------------------
+// Commitment codec
+// -----------------------------------------------------------------------------
+
+function readState(bytes commitment) returns (
+    bytes20, bytes20, bytes20, int, int, int, int, int, int, bytes20, int
+) {
+    require(commitment.length == COMMITMENT_SIZE, "state: bad commitment size");
+    bytes20 supporterPkh = unsafe_bytes20(commitment.slice(0, 20));
+    bytes20 supporteePkh = unsafe_bytes20(commitment.slice(20, 40));
+    bytes20 servicePkh = unsafe_bytes20(commitment.slice(40, 60));
+    int amount = int(commitment.slice(60, 68));
+    int amountNext = int(commitment.slice(68, 76));
+    int period = int(commitment.slice(76, 80));
+    int periodNext = int(commitment.slice(80, 84));
+    int lastPeriodTime = int(commitment.slice(84, 88));
+    int mode = int(commitment.slice(88, 89));
+    bytes20 oraclePkHash = unsafe_bytes20(commitment.slice(89, 109));
+    int lastRate = int(commitment.slice(109, 113));
+    require(amount > 0, "state: amount must be positive");
+    require(amountNext > 0, "state: amountNext must be positive");
+    require(period > 0, "state: period must be positive");
+    require(periodNext > 0, "state: periodNext must be positive");
+    require(mode == 0 || mode == 1, "state: invalid mode");
+    return supporterPkh, supporteePkh, servicePkh, amount, amountNext, period,
+        periodNext, lastPeriodTime, mode, oraclePkHash, lastRate;
+}
+
+function writeState(
+    bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
+    int amount, int amountNext, int period, int periodNext,
+    int lastPeriodTime, int mode, bytes20 oraclePkHash, int lastRate
+) returns (bytes) {
+    bytes commitment = supporterPkh + supporteePkh + servicePkh
+        + toPaddedBytes(amount, 8) + toPaddedBytes(amountNext, 8)
+        + toPaddedBytes(period, 4) + toPaddedBytes(periodNext, 4)
+        + toPaddedBytes(lastPeriodTime, 4) + toPaddedBytes(mode, 1)
+        + oraclePkHash + toPaddedBytes(lastRate, 4);
+    require(commitment.length == COMMITMENT_SIZE, "state: bad commitment size");
+    return commitment;
+}
+
+// -----------------------------------------------------------------------------
+// Actor presence — authorisation without signatures
+// -----------------------------------------------------------------------------
+
+function isPresent(bytes20 pkh) returns (bool) {
+    bool present = false;
+    for (int i = 0; i < tx.inputs.length; i++) {
+        if (tx.inputs[i].lockingBytecode == new LockingBytecodeP2PKH(pkh)) {
+            present = true;
+        }
+        if (tx.inputs[i].lockingBytecode == new LockingBytecodeP2SH20(pkh)) {
+            present = true;
+        }
+    }
+    return present;
+}
+
+// -----------------------------------------------------------------------------
+// Covenant accounting
+// -----------------------------------------------------------------------------
+
+// Index of the single input carrying the mutable state NFT — and it must itself
+// be locked by this covenant. The state NFT and the sats live in the same
+// output, so this input's value IS the settlement balance.
+function stateInputIndex(bytes32 stateCategory, bytes contractLock) returns (int) {
+    int found = -1;
+    int count = 0;
+    for (int i = 0; i < tx.inputs.length; i++) {
+        if (tx.inputs[i].tokenCategory == stateCategory + MUTABLE_NFT) {
+            require(tx.inputs[i].lockingBytecode == contractLock, "state: input not owned by the covenant");
+            found = i;
+            count = count + 1;
+        }
+    }
+    require(count == 1, "state: expected exactly one state input");
+    return found;
+}
+
+// True when a raw `tokenCategory` introspection value names `category` under any
+// NFT capability (none / mutable / minting).
+function isCategoryOf(bytes32 category, bytes tokenCategory) returns (bool) {
+    return tokenCategory == category
+        || tokenCategory == category + 0x01
+        || tokenCategory == category + 0x02;
+}
+
+// -----------------------------------------------------------------------------
+// Service fee (design.md § Architecture Decisions — service fee)
+//
+//   perPeriodFee(x) = max(x · SERVICE_FEE_PERCENT / 100, MIN_FEE_PER_PERIOD)
+//
+// `x` is a **sats** amount. A split INSIDE the payout: `owedPreSettle` is
+// untouched, so an off-by-one in the fee misprices a payment but cannot strand
+// earned funds.
+// -----------------------------------------------------------------------------
+
+function perPeriodFee(int x) returns (int) {
+    int percentage = x * SERVICE_FEE_PERCENT / 100;
+    return max(percentage, MIN_FEE_PER_PERIOD);
+}
+
+// Sats paid for one period at `price` cents/BCH: `amount_cents · 1e8 / price`.
+function grossPerPeriod(int amountCents, int priceCents) returns (int) {
+    require(priceCents > 0, "oracle: price must be positive");
+    return amountCents * SATOSHIS_PER_BCH / priceCents;
+}
+
+// -----------------------------------------------------------------------------
+// Oracle message verification (design.md § Oracle message verification)
+//
+// The GP message is 16 bytes, uint32 LE; the oracle Schnorr-signs sha256(message)
+// and CashScript's `checkDataSig` hashes the message before verifying.
+// -----------------------------------------------------------------------------
+
+function verifyOracle(
+    bytes20 oraclePkHash, int lastPeriodTime, int period,
+    datasig oracleSig, bytes oracleMessage, pubkey oraclePubkey
+) returns (int) {
+    require(oracleMessage.length == 16, "oracle: bad message size");
+    require(hash160(oraclePubkey) == oraclePkHash, "oracle: wrong key");
+    require(checkDataSig(oracleSig, oracleMessage, oraclePubkey), "oracle: bad signature");
+
+    int messageTimestamp = int(oracleMessage.slice(0, 4));
+    int contentSequence = int(oracleMessage.slice(8, 12));
+    int price = int(oracleMessage.slice(12, 16));
+
+    require(contentSequence > 0, "oracle: metadata message");
+    require(messageTimestamp <= tx.locktime, "oracle: future-dated message");
+    // The price must come from the current period: messageTimestamp >= periodStart.
+    int n = (tx.locktime - lastPeriodTime) / period;
+    require(messageTimestamp >= lastPeriodTime + n * period, "oracle: message from an earlier period");
+    require(tx.locktime - messageTimestamp <= FRESHNESS, "oracle: stale message");
+    return price;
+}
+
+// -----------------------------------------------------------------------------
+// Shared settlement core (design.md § Functions — gate → settle → delta)
+//
+//   grossPerPeriod = amount · 1e8 / price        sats per period
+//   n = truncate((tx.locktime − lastPeriodTime) / period)
+//   m = min(n, spendable / grossPerPeriod)       spendable = balance − DUST
+//   gross = m · grossPerPeriod
+//   fee   = m · perPeriodFee(grossPerPeriod)
+//   lastPeriodTime += m · period                 advance by periods PAID
+//   amount = amountNext, period = periodNext     always-replace terms
+//
+// `settleOracle()` NEVER forgives arrears — advancing by `m` (never by `n`)
+// leaves n' = n − m visible. It never recreates the covenant, burns the NFT,
+// refunds or swaps; those are each caller's delta. With m = 0 it is a no-op.
+//
+// `price` is either the verified oracle price or the stored `lastRate`; the
+// caller decides whether to write `lastRate` back (oracle-priced paths only).
+// -----------------------------------------------------------------------------
+
+function settleOracle(
+    bytes20 supporteePkh, bytes20 servicePkh, int amount, int amountNext,
+    int period, int periodNext, int lastPeriodTime, int spendable, int price
+) returns (int, int, int, int, int, int) {
+    require(tx.locktime >= lastPeriodTime, "settle: locktime is before the anchor");
+    int gpp = grossPerPeriod(amount, price);
+    int n = (tx.locktime - lastPeriodTime) / period;
+    int m = min(n, spendable / gpp);
+    int gross = m * gpp;
+    int fee = m * perPeriodFee(gpp);
+    if (gross > 0) {
+        require(tx.outputs[0].lockingBytecode == new LockingBytecodeP2PKH(supporteePkh), "settle: supportee payment destination");
+        require(tx.outputs[0].value == gross - fee, "settle: supportee payment amount");
+        require(tx.outputs[1].lockingBytecode == new LockingBytecodeP2PKH(servicePkh), "settle: service payment destination");
+        require(tx.outputs[1].value == fee, "settle: service payment amount");
+    }
+    return lastPeriodTime + m * period, amountNext, periodNext, gross, n, m;
+}
+
+// -----------------------------------------------------------------------------
+// Output constraints
+// -----------------------------------------------------------------------------
+
+function stateOk(int idx, bytes contractLock, bytes32 stateCategory, bytes commitment) returns (bool) {
+    require(tx.outputs[idx].lockingBytecode == contractLock, "state out: wrong lock");
+    require(tx.outputs[idx].tokenCategory == stateCategory + MUTABLE_NFT, "state out: wrong category");
+    require(tx.outputs[idx].tokenAmount == 0, "state out: must not carry fungibles");
+    require(tx.outputs[idx].nftCommitment == commitment, "state out: wrong commitment");
+    return true;
+}
+
+function paymentOk(int idx, bytes20 pkh, int amount) returns (bool) {
+    require(tx.outputs[idx].lockingBytecode == new LockingBytecodeP2PKH(pkh), "payment: wrong destination");
+    require(tx.outputs[idx].value == amount, "payment: wrong amount");
+    return true;
+}
+
+// Foreign-token cleanup (design.md § Security Notes — stranded funds and foreign
+// tokens). Outputs past the ones the contract mandates may exist (a BCH change
+// output, typically), but they must not carry the state category. A token of any
+// OTHER category is allowed only when routed to `supporterPkh`, so a mis-sent
+// token can be cleared instead of dying with the NFT. The state-category check
+// is evaluated FIRST so the state NFT can never be routed out.
+function tailOk(int fromIndex, bytes32 stateCategory, bytes20 supporterPkh) returns (bool) {
+    for (int i = fromIndex; i < tx.outputs.length; i++) {
+        bytes cat = tx.outputs[i].tokenCategory;
+        if (cat != 0x) {
+            require(!isCategoryOf(stateCategory, cat), "tail: state category must not be routed out");
+            require(tx.outputs[i].lockingBytecode == new LockingBytecodeP2PKH(supporterPkh), "tail: foreign token must go to the supporter");
+        }
+    }
+    return true;
+}
+
+// =============================================================================
+// Subscription state machine — every function is `gate → settle → delta`
+// =============================================================================
+
+contract OracleSubscription(bytes32 stateCategory) {
+
+    // -------------------------------------------------------------------------
+    // pull — permissionless, m-period catch-up, recreates the covenant
+    // -------------------------------------------------------------------------
+    function pull(datasig oracleSig, bytes oracleMessage, pubkey oraclePubkey) {
+        bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
+        (
+            bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
+            int amount, int amountNext, int period, int periodNext,
+            int lastPeriodTime, int mode, bytes20 oraclePkHash, int unused lastRate
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
+
+        require(tx.time >= lastPeriodTime + period, "pull: period has not elapsed yet");
+
+        int price = verifyOracle(oraclePkHash, lastPeriodTime, period, oracleSig, oracleMessage, oraclePubkey);
+
+        int balance = tx.inputs[stateIdx].value;
+        int spendable = balance - DUST;
+        int newLastPeriodTime = lastPeriodTime;
+        int newAmount = amount;
+        int newPeriod = period;
+        int gross = 0;
+        (
+            newLastPeriodTime, newAmount, newPeriod, gross, int unused n, int unused m
+        ) = settleOracle(supporteePkh, servicePkh, amount, amountNext, period, periodNext, lastPeriodTime, spendable, price);
+        // Gate from `settleOracle()`: a settlement that pays nothing must not
+        // happen — an underfunded subscription can never advance its clock.
+        require(gross > 0, "pull: balance does not cover a period");
+
+        // The dust reserve is retained, so `balance − gross ≥ DUST` always.
+        require(stateOk(2, contractLock, stateCategory, writeState(
+            supporterPkh, supporteePkh, servicePkh, newAmount, amountNext,
+            newPeriod, periodNext, newLastPeriodTime, mode, oraclePkHash, price
+        )), "pull: bad state output");
+        require(tx.outputs[2].value == balance - gross, "pull: bad state amount");
+        require(tailOk(3, stateCategory, supporterPkh), "pull: extra outputs");
+    }
+
+    // -------------------------------------------------------------------------
+    // cancel — boundary-gated; settle at lastRate, refund the remainder, burn NFT
+    // -------------------------------------------------------------------------
+    function cancel() {
+        bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
+        (
+            bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
+            int amount, int amountNext, int period, int periodNext,
+            int lastPeriodTime, int unused mode, bytes20 unused oraclePkHash, int lastRate
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
+
+        require(tx.time >= lastPeriodTime + period, "cancel: boundary not reached");
+        require(
+            isPresent(supporterPkh) || isPresent(supporteePkh) || isPresent(servicePkh),
+            "cancel: unauthorised"
+        );
+
+        int balance = tx.inputs[stateIdx].value;
+        int spendable = balance - DUST;
+        int gross = 0;
+        (
+            int unused settledAnchor, int unused promotedAmount, int unused promotedPeriod,
+            gross, int unused n, int unused m
+        ) = settleOracle(supporteePkh, servicePkh, amount, amountNext, period, periodNext, lastPeriodTime, spendable, lastRate);
+
+        int refund = balance - gross;
+
+        int idx = 0;
+        if (gross > 0) {
+            idx = 2;
+        }
+        require(paymentOk(idx, supporterPkh, refund), "cancel: bad refund output");
+        idx = idx + 1;
+        require(tailOk(idx, stateCategory, supporterPkh), "cancel: extra outputs");
+        // The state NFT must be burned: no output may carry the state category
+        // under any capability.
+        for (int i = 0; i < tx.outputs.length; i++) {
+            require(!isCategoryOf(stateCategory, tx.outputs[i].tokenCategory), "cancel: state NFT must be burned");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // modify — mutual consent, always-replace; no settlement, clock untouched
+    // -------------------------------------------------------------------------
+    function modify(int newAmountNext, int newPeriodNext) {
+        require(newAmountNext > 0, "modify: amountNext must be positive");
+        require(newPeriodNext > 0, "modify: periodNext must be positive");
+        bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
+        (
+            bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
+            int amount, int unused amountNext, int period, int unused periodNext,
+            int lastPeriodTime, int mode, bytes20 oraclePkHash, int lastRate
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
+
+        require(
+            isPresent(supporterPkh) && isPresent(supporteePkh),
+            "modify: supporter and supportee must both be present"
+        );
+
+        int balance = tx.inputs[stateIdx].value;
+        require(stateOk(0, contractLock, stateCategory, writeState(
+            supporterPkh, supporteePkh, servicePkh, amount, newAmountNext,
+            period, newPeriodNext, lastPeriodTime, mode, oraclePkHash, lastRate
+        )), "modify: bad state output");
+        require(tx.outputs[0].value == balance, "modify: bad state amount");
+        require(tailOk(1, stateCategory, supporterPkh), "modify: extra outputs");
+    }
+
+    // -------------------------------------------------------------------------
+    // setPkh — 1-signature self-service role transfer; exactly one role per call
+    // -------------------------------------------------------------------------
+    function setPkh(bytes20 newSupporterPkh, bytes20 newSupporteePkh, bytes20 newServicePkh) {
+        bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
+        (
+            bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
+            int amount, int amountNext, int period, int periodNext,
+            int lastPeriodTime, int mode, bytes20 oraclePkHash, int lastRate
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
+
+        int changed = 0;
+        if (newSupporterPkh != supporterPkh) {
+            require(isPresent(supporterPkh), "setPkh: supporter presence required");
+            changed = changed + 1;
+        }
+        if (newSupporteePkh != supporteePkh) {
+            require(isPresent(supporteePkh), "setPkh: supportee presence required");
+            changed = changed + 1;
+        }
+        if (newServicePkh != servicePkh) {
+            require(isPresent(servicePkh), "setPkh: service presence required");
+            changed = changed + 1;
+        }
+        require(changed == 1, "setPkh: exactly one role may change");
+
+        int balance = tx.inputs[stateIdx].value;
+        require(stateOk(0, contractLock, stateCategory, writeState(
+            newSupporterPkh, newSupporteePkh, newServicePkh, amount, amountNext,
+            period, periodNext, lastPeriodTime, mode, oraclePkHash, lastRate
+        )), "setPkh: bad state output");
+        require(tx.outputs[0].value == balance, "setPkh: bad state amount");
+        require(tailOk(1, stateCategory, supporterPkh), "setPkh: extra outputs");
+    }
+
+    // -------------------------------------------------------------------------
+    // fund — permissionless top-up; state untouched, clock untouched
+    // -------------------------------------------------------------------------
+    function fund() {
+        bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
+        (
+            bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
+            int amount, int amountNext, int period, int periodNext,
+            int lastPeriodTime, int mode, bytes20 oraclePkHash, int lastRate
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
+
+        // The covenant's own sats plus whatever the funder contributes in the
+        // same transaction (a plain BCH input) are re-locked into the state out.
+        int balance = tx.inputs[stateIdx].value;
+        require(stateOk(0, contractLock, stateCategory, writeState(
+            supporterPkh, supporteePkh, servicePkh, amount, amountNext,
+            period, periodNext, lastPeriodTime, mode, oraclePkHash, lastRate
+        )), "fund: bad state output");
+        require(tx.outputs[0].value > balance, "fund: nothing to fund");
+        require(tailOk(1, stateCategory, supporterPkh), "fund: extra outputs");
+    }
+
+    // -------------------------------------------------------------------------
+    // withdraw — settle at the oracle, then reclaim `spendable − owedPreSettle`
+    // -------------------------------------------------------------------------
+    function withdraw(datasig oracleSig, bytes oracleMessage, pubkey oraclePubkey) {
+        bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
+        (
+            bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
+            int amount, int amountNext, int period, int periodNext,
+            int lastPeriodTime, int mode, bytes20 oraclePkHash, int unused lastRate
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
+
+        require(isPresent(supporterPkh), "withdraw: supporter presence required");
+
+        int price = verifyOracle(oraclePkHash, lastPeriodTime, period, oracleSig, oracleMessage, oraclePubkey);
+
+        int balance = tx.inputs[stateIdx].value;
+        int spendable = balance - DUST;
+        int newLastPeriodTime = lastPeriodTime;
+        int newAmount = amount;
+        int newPeriod = period;
+        int gross = 0;
+        int n = 0;
+        (
+            newLastPeriodTime, newAmount, newPeriod, gross, n, int unused m
+        ) = settleOracle(supporteePkh, servicePkh, amount, amountNext, period, periodNext, lastPeriodTime, spendable, price);
+
+        // owedPreSettle = gpp · (n + mode): the supportee's PRE-settle entitlement.
+        int gpp = grossPerPeriod(amount, price);
+        int owedPreSettle = gpp * (n + mode);
+        require(spendable >= owedPreSettle, "withdraw: balance is below the reserved amount");
+
+        // The covenant retains `(owedPreSettle − gross) + DUST`; the supporter
+        // takes the rest.
+        int retained = (owedPreSettle - gross) + DUST;
+        int payout = (balance - gross) - retained;
+
+        int idx = 2;
+        if (gross > 0) {
+            idx = 4;
+        }
+        require(stateOk(idx - 2, contractLock, stateCategory, writeState(
+            supporterPkh, supporteePkh, servicePkh, newAmount, amountNext,
+            newPeriod, periodNext, newLastPeriodTime, mode, oraclePkHash, price
+        )), "withdraw: bad state output");
+        require(tx.outputs[idx - 2].value == retained, "withdraw: bad state amount");
+        require(paymentOk(idx, supporterPkh, payout), "withdraw: bad payout output");
+        idx = idx + 1;
+        require(tailOk(idx, stateCategory, supporterPkh), "withdraw: extra outputs");
+    }
+
+    // -------------------------------------------------------------------------
+    // reactivate — only while in arrears: pay the whole balance except DUST,
+    // waive the rest, promote terms, stay on the grid. Does NOT call settle.
+    // -------------------------------------------------------------------------
+    function reactivate(datasig oracleSig, bytes oracleMessage, pubkey oraclePubkey) {
+        bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
+        (
+            bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
+            int amount, int amountNext, int period, int periodNext,
+            int lastPeriodTime, int mode, bytes20 oraclePkHash, int unused lastRate
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
+
+        require(isPresent(supporterPkh), "reactivate: supporter presence required");
+        require(tx.locktime >= lastPeriodTime, "reactivate: locktime is before the anchor");
+
+        int price = verifyOracle(oraclePkHash, lastPeriodTime, period, oracleSig, oracleMessage, oraclePubkey);
+
+        int balance = tx.inputs[stateIdx].value;
+        // `newFunds` is the fresh BCH contributed in this tx beyond the covenant's
+        // own sats: the state output's value minus the covenant's input value.
+        int newFunds = tx.outputs[0].value - balance;
+
+        // Arrears gate, evaluated BEFORE any payment: paused ⟺ balance < payable.
+        int gppOld = grossPerPeriod(amount, price);
+        int n = (tx.locktime - lastPeriodTime) / period;
+        int payable = gppOld * n;
+        require(balance < payable, "reactivate: rejected while funded");
+        int gppNew = grossPerPeriod(amountNext, price);
+        require(newFunds >= gppNew, "reactivate: at least one fresh period must be funded");
+
+        // Pay the whole balance except DUST; the fee is carved out per period paid.
+        int spendable = balance - DUST;
+        int m = spendable / gppOld;
+        int fee = m * perPeriodFee(gppOld);
+        int prepaid = 0;
+        int contractBalance = DUST + newFunds;
+        if (mode == 0) {
+            fee = fee + perPeriodFee(gppNew);
+            prepaid = gppNew;
+            contractBalance = DUST + newFunds - gppNew;
+        }
+        int supporteeAmount = spendable + prepaid - fee;
+
+        // Advance on the grid (waives the unpaid remainder) and promote terms.
+        int newAnchor = lastPeriodTime + n * period;
+        int newAmount = amountNext;
+        int newPeriod = periodNext;
+
+        int idx = 0;
+        if (supporteeAmount > 0) {
+            require(paymentOk(0, supporteePkh, supporteeAmount), "reactivate: bad supportee output");
+            idx = 1;
+        }
+        if (fee > 0) {
+            require(paymentOk(idx, servicePkh, fee), "reactivate: bad service output");
+            idx = idx + 1;
+        }
+        require(stateOk(idx, contractLock, stateCategory, writeState(
+            supporterPkh, supporteePkh, servicePkh, newAmount, amountNext,
+            newPeriod, periodNext, newAnchor, mode, oraclePkHash, price
+        )), "reactivate: bad state output");
+        require(tx.outputs[idx].value == contractBalance, "reactivate: bad state amount");
+        idx = idx + 1;
+        require(tailOk(idx, stateCategory, supporterPkh), "reactivate: extra outputs");
+    }
+
+    // -------------------------------------------------------------------------
+    // migrate — swap the oracle key. Mutual (supporter+supportee) prices at the
+    // current oracle; service-only prices at lastRate and swaps the oracle.
+    // -------------------------------------------------------------------------
+    function migrate(bytes20 newOraclePkHash, datasig oracleSig, bytes oracleMessage, pubkey oraclePubkey) {
+        bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
+        (
+            bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
+            int amount, int amountNext, int period, int periodNext,
+            int lastPeriodTime, int mode, bytes20 oraclePkHash, int lastRate
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
+
+        bool mutual = isPresent(supporterPkh) && isPresent(supporteePkh);
+        bool serviceOnly = isPresent(servicePkh);
+        require(mutual || serviceOnly, "migrate: supporter+supportee or service presence required");
+
+        // Mutual path verifies the current oracle; the service path ignores the
+        // message and prices at lastRate (the recovery path for a dead oracle).
+        int price = lastRate;
+        if (mutual) {
+            price = verifyOracle(oraclePkHash, lastPeriodTime, period, oracleSig, oracleMessage, oraclePubkey);
+        }
+
+        int balance = tx.inputs[stateIdx].value;
+        int spendable = balance - DUST;
+        int gross = 0;
+        (
+            int settledAnchor, int unused promotedAmount, int unused promotedPeriod,
+            gross, int unused n, int unused m
+        ) = settleOracle(supporteePkh, servicePkh, amount, amountNext, period, periodNext, lastPeriodTime, spendable, price);
+
+        // The new oracle key takes effect; `lastRate` carries through unchanged on
+        // the service path, and is refreshed to the verified price on the mutual
+        // path (an oracle-priced settle).
+        int newLastRate = lastRate;
+        if (mutual) {
+            newLastRate = price;
+        }
+
+        int idx = 0;
+        if (gross > 0) {
+            idx = 2;
+        }
+        require(stateOk(idx, contractLock, stateCategory, writeState(
+            supporterPkh, supporteePkh, servicePkh, amount, amountNext,
+            period, periodNext, settledAnchor, mode, newOraclePkHash, newLastRate
+        )), "migrate: bad state output");
+        require(tx.outputs[idx].value == balance - gross, "migrate: bad state amount");
+        idx = idx + 1;
+        require(tailOk(idx, stateCategory, supporterPkh), "migrate: extra outputs");
+    }
+}
