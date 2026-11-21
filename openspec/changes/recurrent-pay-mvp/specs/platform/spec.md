@@ -53,8 +53,9 @@ for the final demo; chipnet for development.
   on mainnet
 
 ### Requirement: Git workflow
-`main` (protected, production) ← `develop` ← feature branches. Conventional Commits. PRs target
-`develop` with review. GitHub is primary; GitLab mirror is post-MVP.
+The repo SHALL use `main` (protected, production) ← `develop` ← feature branches, with
+Conventional Commits and PRs targeting `develop` with review. GitHub SHALL be primary; GitLab
+mirror is post-MVP.
 
 #### Scenario: Conventional commits enforced
 - **GIVEN** a commit on a feature branch

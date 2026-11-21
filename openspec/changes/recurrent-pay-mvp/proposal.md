@@ -21,7 +21,7 @@ event and disclosed in the README and submission, per hackathon rules.
     `migrate` (asset swap) · `fund` · `withdraw` · `reactivate`.
   - Modes A (pay-then-use) and B (lock-then-use), differing only in initial `lastPeriodTime`.
 - **NestJS txserver** — watches active covenants via Electrum/Fulcrum, executes pulls with
-  n-period catch-up (including oracle fetch for BCH subs), tracks derived subscription state in
+  m-period catch-up (including oracle fetch for BCH subs), tracks derived subscription state in
   Postgres, emits notifications (pre-due buffer, success/failure, config changes).
 - **Next.js web app** — WizardConnect wallet connection, subscription creation wizard, dashboard
   with live status/next-payment, top-up, cancel, modify, transfer, withdraw, reactivate; receipt
@@ -53,6 +53,15 @@ event and disclosed in the README and submission, per hackathon rules.
   - **Contracts Prep** (milestone 1): US #1–#6 — toolchain, token contract (core + advanced), oracle contract, test suite, freeze + smoke
   - **BCH BLAZE Hackathon** (milestone 2): US #7–#19 — monorepo, shared pkg, txserver (watcher/executor/API), web app (connect/create/dashboard/detail), E2E, receipts (cuttable), deploy, submission
 
+## Stretch (MVP, sequence after the demo path)
+
+- **Creation covenant (factory)** — a param-free covenant locking the carrier's output 0, enforcing
+  on-chain: one `mutable` state NFT, no `minting` NFT, escrow ≥ `amount + seed`, state/escrow on the
+  same script, supporter presence. Turns the creation invariants from builder rules into on-chain
+  checks — but the guarantee is **per-path** (a creator can bypass it with their own carrier), so the
+  txserver genesis validation stays. Build only after txserver pull + E2E are green; timeboxed; cut
+  if it slips. See design.md § Creation covenant (factory) — MVP stretch goal.
+
 ## Out of Scope (MVP)
 
 - Mode C (pro-rata mid-period cancel) — stretch
@@ -60,3 +69,12 @@ event and disclosed in the README and submission, per hackathon rules.
 - Role NFTs in covenant auth — rejected for MVP (see design.md)
 - P2SH32 / P2S actor fields — post-MVP
 - Multisig/DAO actors — works via presence auth, tested as stretch
+- Service-fee tiers / per-sub fees — the fee is a fixed 1% with a per-period minimum (constants,
+  see the contract spec); a per-sub or tiered fee would need a commitment field
+- Oracle-derived cent floor (the oracle contract uses a fixed 1000-sat floor), swap-then-settle
+  migrate, 2-of-3 migrate auth, service-unilateral config change, `pull` participant restriction
+  (see design.md § Migrate ordering — alternatives)
+- **Creation covenant (factory), strong version** — the MVP factory (if built) enforces the creation
+  rules on-chain but does not recompute the sub address; the strong version embeds a copy of the sub
+  script as a literal to verify `hash160(subScript(stateCategory))`, which must be kept in sync with
+  the sub contract forever. See design.md § Creation covenant (factory)
