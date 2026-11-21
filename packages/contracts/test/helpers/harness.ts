@@ -4,8 +4,12 @@
  * Everything here mirrors `contracts/token-subscription.cash`: the commitment
  * codec, the settlement arithmetic and the canonical output layout of every
  * covenant spend. The harness *derives* the expected transaction layout from
- * (state, balance, clock) — the same computation the txserver performs — so each
+ * (state, escrow, clock) — the same computation the txserver performs — so each
  * test cross-checks the contract against an independent reference implementation.
+ *
+ * Escrow identity: the state UTXO and the escrow UTXO share the same txid
+ * (co-creation). A `stray` funds UTXO (different txid) can be added for the
+ * rejection tests.
  */
 import {
   Contract,
@@ -31,10 +35,20 @@ import {
   type Settlement,
   type Mode,
 } from '../../src/commitment.js';
+import { SEED, perPeriodFee } from '../../src/constants.js';
 
 const { hash160 } = utils;
 
-export { COMMITMENT_SIZE, MODE_A, MODE_B, encodeCommitment, decodeCommitment, settle };
+export {
+  COMMITMENT_SIZE,
+  MODE_A,
+  MODE_B,
+  encodeCommitment,
+  decodeCommitment,
+  settle,
+  SEED,
+  perPeriodFee,
+};
 export type { SubscriptionState, Settlement, Mode };
 
 // ---------------------------------------------------------------------------
@@ -104,7 +118,11 @@ export interface ScenarioOptions {
   mode: Mode;
   amount: bigint;
   period: number;
-  balance: bigint;
+  /**
+   * The covenant's **escrow** amount (seed included). Creation funds
+   * `amount + seed`; the default here is `amount + seed` (one period + seed).
+   */
+  escrow?: bigint;
   /** Creation time in unix seconds. */
   creationTime: number;
   fundsCategory?: string;
@@ -152,10 +170,13 @@ export class Scenario {
   covenantSats: bigint;
 
   private state_: SubscriptionState;
-  private balance: bigint;
+  /** The escrow amount (seed included). `spendable = escrow − SEED`. */
+  private escrow: bigint;
   private stateUtxo!: SpendableUtxo;
   private fundsUtxo?: SpendableUtxo;
   private nonce = 0;
+  /** The shared txid of the co-created state + escrow UTXOs. */
+  private coTxid = randomTxid();
 
   constructor(options: ScenarioOptions) {
     this.provider = new MockNetworkProvider({ vmTarget: 'BCH_2026_05' });
@@ -183,7 +204,7 @@ export class Scenario {
       mode: options.mode,
       fundsCategory: hexToBin(this.fundsCategory),
     };
-    this.balance = options.balance;
+    this.escrow = options.escrow ?? options.amount + SEED;
 
     this.contract = new Contract(artifact, [this.stateCategory], {
       provider: this.provider,
@@ -210,11 +231,22 @@ export class Scenario {
     return this.state_;
   }
 
-  get currentBalance(): bigint {
-    return this.balance;
+  /** The escrow amount (seed included). */
+  get currentEscrow(): bigint {
+    return this.escrow;
   }
 
-  /** (Re)creates the covenant UTXOs from the current state and balance. */
+  /** The settlement balance: `escrow − SEED`. */
+  get spendable(): bigint {
+    return this.escrow - SEED;
+  }
+
+  /** The escrow amount after a settle: `escrow − gross`. */
+  escrowAfter(s: Settlement): bigint {
+    return this.escrow - s.gross;
+  }
+
+  /** (Re)creates the covenant UTXOs from the current state and escrow. */
   refresh(): void {
     this.provider.reset();
     const commitment = binToHex(encodeCommitment(this.state));
@@ -222,9 +254,12 @@ export class Scenario {
     // (raw libauth bytes); the VM's `tokenCategory` introspection reverses the
     // category it renders, so a UTXO registered with the display-order form is
     // what `stateInputIndex`'s `stateCategory + 0x01` comparison expects.
+    //
+    // The state NFT and the escrow are CO-CREATED: they share `this.coTxid`, so
+    // `escrowInputIndex`'s `outpointTransactionHash` comparison succeeds.
     this.stateUtxo = this.provider.addUtxo(this.contract.lockingBytecode, {
-      txid: randomTxid(),
-      vout: 0,
+      txid: this.coTxid,
+      vout: 1,
       satoshis: this.covenantSats,
       token: {
         category: this.stateCategoryDisplay,
@@ -233,12 +268,12 @@ export class Scenario {
       },
     });
     this.fundsUtxo =
-      this.balance > 0n
+      this.escrow > 0n
         ? this.provider.addUtxo(this.contract.lockingBytecode, {
-            txid: randomTxid(),
+            txid: this.coTxid,
             vout: 0,
             satoshis: this.covenantSats,
-            token: { category: this.fundsCategoryDisplay, amount: this.balance },
+            token: { category: this.fundsCategoryDisplay, amount: this.escrow },
           })
         : undefined;
     this.nonce += 1;
@@ -250,9 +285,9 @@ export class Scenario {
     this.refresh();
   }
 
-  /** Mutates the covenant's funds balance (then re-creates the UTXOs). */
-  setBalance(balance: bigint): void {
-    this.balance = balance;
+  /** Mutates the covenant's escrow (then re-creates the UTXOs). */
+  setEscrow(escrow: bigint): void {
+    this.escrow = escrow;
     this.refresh();
   }
 
@@ -279,6 +314,27 @@ export class Scenario {
     return { state, funds };
   }
 
+  /**
+   * Reads the total amount of `category` tokens held by `role`'s address in the
+   * provider's UTXO set — used to assert payment outputs (supportee/service).
+   */
+  async readRoleTokens(role: Role, category: string): Promise<bigint> {
+    const utxos = await this.provider.getUtxosForLockingBytecode(role.lock);
+    let total = 0n;
+    for (const utxo of utxos) {
+      if (utxo.token?.category === category) {
+        total += utxo.token.amount;
+      }
+    }
+    return total;
+  }
+
+  /** Reads the covenant's funds balance for an arbitrary category. */
+  async readCovenantFunds(category: string): Promise<bigint | undefined> {
+    const utxos = await this.provider.getUtxosForLockingBytecode(hexToBin(this.contract.lockingBytecode));
+    return utxos.find((u) => u.token?.category === category)?.token?.amount;
+  }
+
   /** Moves the clock. */
   advance(seconds: number): void {
     this.now += seconds;
@@ -297,12 +353,14 @@ export class Scenario {
     await this.sync();
   }
 
+  /** Settlement against the current escrow. */
   settlement(): Settlement {
-    return settle(this.state, this.balance, this.now);
+    return settle(this.state, this.spendable, this.now);
   }
 
-  settlementWith(balance: bigint): Settlement {
-    return settle(this.state, balance, this.now);
+  /** Settlement against an explicit escrow amount (seed included). */
+  settlementWithEscrow(escrow: bigint): Settlement {
+    return settle(this.state, escrow - SEED, this.now);
   }
 
   // -- inputs & outputs -----------------------------------------------------
@@ -326,6 +384,59 @@ export class Scenario {
       satoshis: this.covenantSats,
       token: { category, amount },
     });
+  }
+
+  /**
+   * A **stray** funds UTXO: a funds-category token output with a *different*
+   * txid than the co-created escrow. It must never be accepted as escrow.
+   */
+  stray(amount: bigint, owner: Role = this.supporter): SpendableUtxo {
+    return this.provider.addUtxo(binToHex(owner.lock), {
+      ...this.nextOutpoint(),
+      satoshis: this.covenantSats,
+      token: { category: this.fundsCategoryDisplay, amount },
+    });
+  }
+
+  /**
+   * A **co-created** escrow UTXO (same txid as the state NFT) but locked to a
+   * *different* script than the covenant. It satisfies the co-creation check yet
+   * must be rejected by the covenant-lock check — otherwise a creation whose
+   * escrow is locked elsewhere would yield an unusable sub.
+   */
+  coCreatedEscrowElsewhere(amount: bigint, owner: Role = this.supporter): SpendableUtxo {
+    return this.provider.addUtxo(binToHex(owner.lock), {
+      txid: this.coTxid,
+      vout: 0,
+      satoshis: this.covenantSats,
+      token: { category: this.fundsCategoryDisplay, amount },
+    });
+  }
+
+  /**
+   * A **foreign** token UTXO: a token of an unrelated category (neither the funds
+   * nor the state category), controlled by `owner`. Used to test the foreign-token
+   * cleanup path (`tailOk`). Returns the UTXO; its `token.category` is the
+   * display-order category to reuse in `foreignOutput`.
+   */
+  foreignToken(owner: Role, amount: bigint, category: string = randomCategory()): SpendableUtxo {
+    return this.provider.addUtxo(binToHex(owner.lock), {
+      ...this.nextOutpoint(),
+      satoshis: this.covenantSats,
+      token: { category: toDisplayCategory(category), amount },
+    });
+  }
+
+  /**
+   * A token output of an unrelated category locked to `role` (cleanup target).
+   * `category` is in **display order** (the form `foreignToken`'s UTXO carries).
+   */
+  foreignOutput(role: Role, category: string, amount: bigint): Output {
+    return {
+      to: role.lock,
+      amount: this.covenantSats,
+      token: { category, amount },
+    };
   }
 
   covenantLock(): Uint8Array {
@@ -388,13 +499,10 @@ export class Scenario {
     const s = this.settlement();
     const next = { ...this.state, ...promote(s) };
     const tx = this.base(() => this.unlock()['pull']!());
-    if (s.paid > 0n) {
-      tx.addOutput(this.paymentOutput(this.supportee, this.fundsCategoryDisplay, s.paid));
-    }
+    tx.addOutput(this.paymentOutput(this.supportee, this.fundsCategoryDisplay, s.paid));
+    tx.addOutput(this.paymentOutput(this.service, this.fundsCategoryDisplay, s.fee));
     tx.addOutput(this.stateOutput(encodeCommitment(next)));
-    if (s.remaining > 0n) {
-      tx.addOutput(this.fundsOutput(this.fundsCategoryDisplay, s.remaining));
-    }
+    tx.addOutput(this.fundsOutput(this.fundsCategoryDisplay, this.escrowAfter(s)));
     return this.pay(tx, this.service);
   }
 
@@ -402,12 +510,13 @@ export class Scenario {
   cancel(authorizer: Role = this.service): TransactionBuilder {
     const s = this.settlement();
     const tx = this.base(() => this.unlock()['cancel']!());
-    if (s.paid > 0n) {
+    if (s.gross > 0n) {
       tx.addOutput(this.paymentOutput(this.supportee, this.fundsCategoryDisplay, s.paid));
+      tx.addOutput(this.paymentOutput(this.service, this.fundsCategoryDisplay, s.fee));
     }
-    if (s.remaining > 0n) {
-      tx.addOutput(this.paymentOutput(this.supporter, this.fundsCategoryDisplay, s.remaining));
-    }
+    // Refund = totalIn − gross = (escrow − gross) + strays.
+    const refund = this.escrow - s.gross + this.strayTotal;
+    tx.addOutput(this.paymentOutput(this.supporter, this.fundsCategoryDisplay, refund));
     return this.pay(tx, authorizer);
   }
 
@@ -416,9 +525,7 @@ export class Scenario {
     const next = { ...this.state, amountNext, periodNext };
     const tx = this.base(() => this.unlock()['modify']!(amountNext, BigInt(periodNext)));
     tx.addOutput(this.stateOutput(encodeCommitment(next)));
-    if (this.balance > 0n) {
-      tx.addOutput(this.fundsOutput(this.fundsCategoryDisplay, this.balance));
-    }
+    tx.addOutput(this.fundsOutput(this.fundsCategoryDisplay, this.escrow + this.strayTotal));
     return this.pay(tx, payer);
   }
 
@@ -437,9 +544,7 @@ export class Scenario {
     const other = payer === this.supporter ? this.supportee : this.supporter;
     tx.addInput(this.input(other), other.template.unlockP2PKH());
     tx.addOutput(this.stateOutput(encodeCommitment(next)));
-    if (this.balance > 0n) {
-      tx.addOutput(this.fundsOutput(this.fundsCategoryDisplay, this.balance));
-    }
+    tx.addOutput(this.fundsOutput(this.fundsCategoryDisplay, this.escrow + this.strayTotal));
     return tx.addBchChangeOutputIfNeeded({ to: payer.lock, feeRate: 1 });
   }
 
@@ -458,9 +563,7 @@ export class Scenario {
       this.unlock()['setPkh']!(next.supporterPkh, next.supporteePkh, next.servicePkh),
     );
     tx.addOutput(this.stateOutput(encodeCommitment(next)));
-    if (this.balance > 0n) {
-      tx.addOutput(this.fundsOutput(this.fundsCategoryDisplay, this.balance));
-    }
+    tx.addOutput(this.fundsOutput(this.fundsCategoryDisplay, this.escrow + this.strayTotal));
     return this.pay(tx, payer);
   }
 
@@ -470,10 +573,10 @@ export class Scenario {
     const tx = this.base(() => this.unlock()['fund']!());
     tx.addInput(funding, funder.template.unlockP2PKH());
     tx.addOutput(this.stateOutput(encodeCommitment(this.state)));
-    tx.addOutput(this.fundsOutput(this.fundsCategoryDisplay, this.balance + amount));
-    // The covenant now holds the extra funds; keep the tracked balance in sync so
+    tx.addOutput(this.fundsOutput(this.fundsCategoryDisplay, this.escrow + this.strayTotal + amount));
+    // The covenant now holds the extra funds; keep the tracked escrow in sync so
     // subsequent transitions (pull/withdraw/…) compute the right settlement.
-    this.balance += amount;
+    this.escrow += this.strayTotal + amount;
     return this.pay(tx, funder);
   }
 
@@ -485,52 +588,69 @@ export class Scenario {
   async sync(): Promise<void> {
     const live = await this.readCovenant();
     if (live.state !== undefined) this.state_ = live.state;
-    this.balance = live.funds ?? 0n;
+    this.escrow = live.funds ?? 0n;
     this.refresh();
   }
 
-  /** Canonical `withdraw`: settle, then reclaim `balance − reserved`. */
+  /** Canonical `withdraw`: settle, then reclaim `spendable − owedPreSettle`. */
   withdraw(): TransactionBuilder {
     const s = this.settlement();
     const next = { ...this.state, ...promote(s) };
-    const retained = s.reserved - s.paid;
-    const payout = s.remaining - retained;
+    const retained = s.owedPreSettle - s.gross + SEED;
+    const payout = this.escrow - s.gross - retained;
+    const supporterOut = payout + this.strayTotal;
     const tx = this.base(() => this.unlock()['withdraw']!());
-    if (s.paid > 0n) {
+    if (s.gross > 0n) {
       tx.addOutput(this.paymentOutput(this.supportee, this.fundsCategoryDisplay, s.paid));
+      tx.addOutput(this.paymentOutput(this.service, this.fundsCategoryDisplay, s.fee));
     }
     tx.addOutput(this.stateOutput(encodeCommitment(next)));
-    if (retained > 0n) {
-      tx.addOutput(this.fundsOutput(this.fundsCategoryDisplay, retained));
-    }
-    if (payout > 0n) {
-      tx.addOutput(this.paymentOutput(this.supporter, this.fundsCategoryDisplay, payout));
-    }
+    tx.addOutput(this.fundsOutput(this.fundsCategoryDisplay, retained));
+    tx.addOutput(this.paymentOutput(this.supporter, this.fundsCategoryDisplay, supporterOut));
     return this.pay(tx, this.supporter);
   }
 
   /**
-   * Canonical `reactivate`: settle, waive the surviving arrears, re-anchor the
-   * clock to `now`. `extraFunding` is the additional period(s) the supporter
-   * funds inside the same transaction.
+   * Canonical `reactivate`: pay the whole escrow except the seed, waive the rest,
+   * promote terms, stay on the grid. `extraFunding` is the additional period(s)
+   * the supporter funds inside the same transaction (`newFunds`).
    */
   reactivate(extraFunding: bigint = 0n, funder: Role = this.supporter): TransactionBuilder {
-    const funded = this.balance + extraFunding;
-    const s = this.settlementWith(funded);
-    const next = { ...this.state, ...promote(s), lastPeriodTime: this.now };
+    const newFunds = extraFunding + this.strayTotal;
+    const spendable = this.escrow - SEED;
+    const n = BigInt(Math.floor((this.now - this.state.lastPeriodTime) / this.state.period));
+    const m = spendable / this.state.amount;
+    const mode = this.state.mode;
+    const fee =
+      m * perPeriodFee(this.state.amount) +
+      (mode === 1 ? 0n : perPeriodFee(this.state.amountNext));
+    const supporteeAmount = spendable + (mode === 1 ? 0n : this.state.amountNext) - fee;
+    const newAnchor = this.state.lastPeriodTime + Number(n) * this.state.period;
+    const next = {
+      ...this.state,
+      amount: this.state.amountNext,
+      period: this.state.periodNext,
+      lastPeriodTime: newAnchor,
+    };
+    const contractBalance = SEED + (mode === 1 ? newFunds : newFunds - this.state.amountNext);
+
     const tx = this.base(() => this.unlock()['reactivate']!());
     if (extraFunding > 0n) {
       // The funder's contribution is an input; it must be added *before* the BCH
       // change output that `pay()` appends, but after the two covenant inputs.
       tx.addInput(this.tokenInput(funder, this.fundsCategoryDisplay, extraFunding), funder.template.unlockP2PKH());
     }
-    if (s.paid > 0n) {
-      tx.addOutput(this.paymentOutput(this.supportee, this.fundsCategoryDisplay, s.paid));
+    let idx = 0;
+    if (supporteeAmount > 0n) {
+      tx.addOutput(this.paymentOutput(this.supportee, this.fundsCategoryDisplay, supporteeAmount));
+      idx = 1;
+    }
+    if (fee > 0n) {
+      tx.addOutput(this.paymentOutput(this.service, this.fundsCategoryDisplay, fee));
+      idx = idx + 1;
     }
     tx.addOutput(this.stateOutput(encodeCommitment(next)));
-    if (s.remaining > 0n) {
-      tx.addOutput(this.fundsOutput(this.fundsCategoryDisplay, s.remaining));
-    }
+    tx.addOutput(this.fundsOutput(this.fundsCategoryDisplay, contractBalance));
     return this.pay(tx, this.supporter);
   }
 
@@ -548,37 +668,51 @@ export class Scenario {
     funder: Role = this.supporter,
   ): TransactionBuilder {
     const s = this.settlement();
-    const newDisplay = toDisplayCategory(newFundsCategory);
+    // Mirror the funds-category convention: the contract argument and the
+    // commitment store the category in *internal* order (the same form
+    // `fundsCategory` uses); the provider stores inputs/outputs in *display* order.
+    const newInternal = newFundsCategory;
+    const newDisplay = toDisplayCategory(newInternal);
     // `migrate` re-denominates by mutual agreement: the new amount/amountNext are
     // written immediately (not promoted from the old terms), and the clock is the
-    // settle's new anchor. The commitment stores the category in *display* order —
-    // the same form VM `tokenCategory` introspection reports.
+    // settle's new anchor.
     const next = {
       ...this.state,
       amount: newAmount,
       amountNext: newAmountNext,
       lastPeriodTime: s.newLastPeriodTime,
-      fundsCategory: hexToBin(newDisplay),
+      fundsCategory: hexToBin(newInternal),
     };
-    const tx = this.base(() => this.unlock()['migrate']!(newDisplay, newAmount, newAmountNext));
+    const tx = this.base(() => this.unlock()['migrate']!(newInternal, newAmount, newAmountNext));
     // The funder's token input carries the new asset in display order (the form the
     // provider stores); the covenant then sees it via `totalIn`.
     tx.addInput(this.tokenInput(funder, newDisplay, funding), funder.template.unlockP2PKH());
     // The contract requires supporter AND supportee presence: add the other party.
     const other = funder === this.supporter ? this.supportee : this.supporter;
     tx.addInput(this.input(other), other.template.unlockP2PKH());
-    if (s.paid > 0n) {
+    if (s.gross > 0n) {
       tx.addOutput(this.paymentOutput(this.supportee, this.fundsCategoryDisplay, s.paid));
+      tx.addOutput(this.paymentOutput(this.service, this.fundsCategoryDisplay, s.fee));
     }
     tx.addOutput(this.stateOutput(encodeCommitment(next)));
-    if (funding > 0n) {
-      tx.addOutput(this.fundsOutput(newDisplay, funding));
-    }
+    // The funds output is ALWAYS recreated (newEscrow ≥ SEED ≥ 1).
+    tx.addOutput(this.fundsOutput(newDisplay, funding));
     // The old-asset remainder comes only when settle left something behind.
-    if (this.balance - s.paid > 0n) {
-      tx.addOutput(this.paymentOutput(this.supporter, this.fundsCategoryDisplay, this.balance - s.paid));
+    const oldRemainder = this.escrow - s.gross + this.strayTotal;
+    if (oldRemainder > 0n) {
+      tx.addOutput(this.paymentOutput(this.supporter, this.fundsCategoryDisplay, oldRemainder));
     }
     return tx.addBchChangeOutputIfNeeded({ to: funder.lock, feeRate: 1 });
+  }
+
+  /** Total funds-category value contributed as strays in the current transition. */
+  strayTotal = 0n;
+
+  /** Registers a stray funds UTXO and records its amount for the layout math. */
+  addStray(amount: bigint, owner: Role = this.supporter): SpendableUtxo {
+    const utxo = this.stray(amount, owner);
+    this.strayTotal += amount;
+    return utxo;
   }
 }
 
@@ -586,4 +720,3 @@ export class Scenario {
 export function scenario(options: ScenarioOptions): Scenario {
   return new Scenario(options);
 }
-

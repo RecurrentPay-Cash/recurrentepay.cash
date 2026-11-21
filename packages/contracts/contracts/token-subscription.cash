@@ -7,22 +7,31 @@ pragma cashscript ^0.14.0;
 //   openspec/changes/recurrent-pay-mvp/design.md
 //       § Contract State Model
 //       § Functions — gate → settle → delta
-//       § Settlement semantics (n-period catch-up)
+//       § Settlement semantics (m-period catch-up)
 //       § Arrears, pause and reactivation
+//       § Security Notes
 //   openspec/changes/recurrent-pay-mvp/specs/subscription-contract/spec.md
 //
 // -----------------------------------------------------------------------------
-// MODEL
+// MODEL (Nov 16–17 revision)
 //
 // A token subscription is a covenant made of TWO UTXOs, both locked by this same
 // contract (same constructor args):
 //
 //   * state UTXO — one MUTABLE NFT of `stateCategory`; its commitment carries the
 //                  whole subscription state (121 bytes, layout below).
-//   * funds UTXO — fungible tokens of `fundsCategory` (the subscription asset).
+//   * escrow UTXO — fungible tokens of `fundsCategory` (the subscription asset).
 //
-// Every transition spends and recreates both, EXCEPT `cancel`, which burns the
-// state NFT and refunds the remainder to the supporter.
+// The escrow is identified by CO-CREATION: it is the funds-category input whose
+// `outpointTransactionHash` equals the state NFT input's (they were created in the
+// same genesis transaction). This stops a stray funds UTXO (different txid) from
+// posing as escrow. The settlement balance is the ESCROW ONLY, never `totalIn`.
+//
+// The covenant always holds at least ONE unit — the SEED — supplied by the
+// supporter at creation (`amount + seed`), retained for the sub's life, refunded
+// at `cancel`. `spendable = escrow − SEED`. This makes co-creation unconditional:
+// a 0-unit token output is not a token UTXO, so without the seed "the escrow
+// exists" would have an empty-escrow hole.
 //
 // -----------------------------------------------------------------------------
 // COMMITMENT LAYOUT — 121 bytes (network limit: 128)
@@ -39,27 +48,26 @@ pragma cashscript ^0.14.0;
 //   89..121  fundsCategory   bytes32
 //
 // `amount`/`period` are the rate of the period that just ended; `amountNext`/
-// `periodNext` are the rate for the upcoming period. They differ only while a
-// `modify` is pending — "always-replace": `pull` promotes them unconditionally,
-// with no sentinel and no branch.
+// `periodNext` are the rate for the upcoming period. "Always-replace": `pull`
+// and `reactivate` promote them unconditionally, no sentinel, no branch.
 //
 // Epoch note: `lastPeriodTime` is stored in 4 bytes, so OP_NUM2BIN caps it at
 // 2^31 − 1 (2038-01-19). Ample for the MVP; flagged for the v2 commitment layout.
 //
 // -----------------------------------------------------------------------------
-// OUTPUT LAYOUT — one uniform rule, fully determined by the state
+// OUTPUT LAYOUT — fixed indices, `m = 0` shifts later outputs down
 //
-//   0                 the supportee's settlement payment (`m · amount`) — only when m > 0
-//   then, in order:   • the recreated state UTXO                 (all functions but `cancel`)
-//                     • the recreated funds UTXO                 (only when the remainder > 0)
-//                     • the function's own extras                (withdraw / migrate / nothing)
+//   pull:      0 supportee (gross − fee), 1 service (fee), 2 state, 3 funds (escrow − gross)
+//   cancel:    [0 supportee, 1 service] if gross > 0, then refund (totalIn − gross), burn NFT
+//   modify:    0 state, 1 funds (totalIn)
+//   setPkh:    0 state, 1 funds (totalIn)
+//   fund:      0 state, 1 funds (totalIn)
+//   withdraw:  [0 supportee, 1 service] if gross > 0, then state, funds(retained), payout
+//   reactivate:[0 supportee] if supporteeAmount > 0, [service] if fee > 0, state, funds
+//   migrate:   [0 supportee, 1 service] if gross > 0, state, funds(new), old remainder
 //
-// So `m > 0` shifts every later output by exactly one slot. `m` is derived from
-// (balance, clock) — the same arithmetic the txserver performs — so the layout is
-// deterministic off-chain. Any further output (BCH change, typically) is allowed
-// but must carry no token at all.
-//
-// A zero balance is representable: the funds UTXO simply is not recreated.
+// Any further output (BCH change, typically) is allowed but must carry no token,
+// except a foreign-category token routed to the supporter (see `tailOk`).
 //
 // -----------------------------------------------------------------------------
 // AUTHORISATION — `presence-always`, no signatures
@@ -77,6 +85,13 @@ pragma cashscript ^0.14.0;
 
 int constant COMMITMENT_SIZE = 121;
 bytes constant MUTABLE_NFT = 0x01;
+
+// The 1-unit seed: always retained so the escrow UTXO always exists.
+int constant SEED = 1;
+// Service fee: a percent (divisor /100), charged per period paid.
+int constant SERVICE_FEE_PERCENT = 1;
+// Token floor: at least this many base units per period paid.
+int constant MIN_FEE_PER_PERIOD = 1;
 
 // -----------------------------------------------------------------------------
 // Commitment codec
@@ -158,15 +173,36 @@ function stateInputIndex(bytes32 stateCategory, bytes contractLock) returns (int
     return found;
 }
 
+// The escrow is the funds-category input CO-CREATED with the state NFT: it shares
+// the state input's `outpointTransactionHash`. A stray funds UTXO (different txid)
+// can never satisfy this, so it can never pose as escrow. It must ALSO be locked by
+// this covenant (mirroring `stateInputIndex`): a co-created escrow locked to a
+// different script would otherwise produce an unusable sub whose funds the covenant
+// can never spend. Every function requires the escrow as an input — a function that
+// recreates or burns the covenant without spending the escrow would silently demote
+// it to a stray.
+function escrowInputIndex(int stateIdx, bytes32 fundsCategory, bytes contractLock) returns (int) {
+    int found = -1;
+    int count = 0;
+    for (int i = 0; i < tx.inputs.length; i++) {
+        if (tx.inputs[i].tokenCategory == fundsCategory) {
+            if (tx.inputs[i].outpointTransactionHash == tx.inputs[stateIdx].outpointTransactionHash) {
+                require(tx.inputs[i].lockingBytecode == contractLock, "escrow: input not owned by the covenant");
+                found = i;
+                count = count + 1;
+            }
+        }
+    }
+    require(count == 1, "escrow: missing co-created escrow input");
+    return found;
+}
+
 // Total fungible balance of `category` brought into the transaction: the
 // covenant's own funds UTXO plus anything a party contributes in the same
-// transaction (this is how `fund` and `migrate` work). Summing the inputs —
-// rather than trusting one of them — makes the conservation checks airtight:
-// every unit that comes in has to come out again.
-//
-// Notes: a fungible token of the *state* category can never be counted here
-// (`categories must differ`); and a capability-carrying NFT of the same category
-// reports `tokenCategory == category + 0x01`, so it is excluded too.
+// transaction. Used to (a) absorb strays (`fund`), (b) sweep strays into a
+// refund/payout (`cancel`/`withdraw`), (c) count the new asset in (`migrate`)
+// and (d) preserve the full balance (`modify`/`setPkh`). NEVER used as the
+// settlement balance — that is the escrow alone.
 function totalIn(bytes32 category) returns (int) {
     int total = 0;
     for (int i = 0; i < tx.inputs.length; i++) {
@@ -186,11 +222,27 @@ function isCategoryOf(bytes32 category, bytes tokenCategory) returns (bool) {
 }
 
 // -----------------------------------------------------------------------------
+// Service fee (design.md § Architecture Decisions — service fee)
+//
+//   perPeriodFee(x) = max(x · SERVICE_FEE_PERCENT / 100, MIN_FEE_PER_PERIOD)
+//
+// A split INSIDE the payout: the pre-settle entitlement (`owedPreSettle =
+// amount · (n + mode)`) is untouched, so an off-by-one in the fee can misprice a
+// payment but cannot strand earned funds.
+// -----------------------------------------------------------------------------
+
+function perPeriodFee(int x) returns (int) {
+    int percentage = x * SERVICE_FEE_PERCENT / 100;
+    return max(percentage, MIN_FEE_PER_PERIOD);
+}
+
+// -----------------------------------------------------------------------------
 // Shared settlement core (design.md § Functions — gate → settle → delta)
 //
 //   n = truncate((tx.locktime − lastPeriodTime) / period)   elapsed periods
-//   m = min(n, floor(balance / amount))                     periods the balance covers
-//   pay the supportee m · amount at output 0
+//   m = min(n, floor(spendable / amount))                   periods the escrow covers
+//   gross = m · amount                                      paid to the supportee
+//   fee   = m · perPeriodFee(amount)                        routed to servicePkh
 //   lastPeriodTime += m · period                            advance by periods PAID
 //   amount = amountNext, period = periodNext                always-replace terms
 //
@@ -203,19 +255,24 @@ function isCategoryOf(bytes32 category, bytes tokenCategory) returns (bool) {
 // -----------------------------------------------------------------------------
 
 function settle(
-    bytes20 supporteePkh, int amount, int amountNext, int period, int periodNext,
-    int lastPeriodTime, int balance, bytes32 fundsCategory
+    bytes20 supporteePkh, bytes20 servicePkh, int amount, int amountNext,
+    int period, int periodNext, int lastPeriodTime, int spendable,
+    bytes32 fundsCategory
 ) returns (int, int, int, int, int, int) {
     require(tx.locktime >= lastPeriodTime, "settle: locktime is before the anchor");
     int n = (tx.locktime - lastPeriodTime) / period;
-    int m = min(n, balance / amount);
-    int paid = m * amount;
-    if (paid > 0) {
+    int m = min(n, spendable / amount);
+    int gross = m * amount;
+    int fee = m * perPeriodFee(amount);
+    if (gross > 0) {
         require(tx.outputs[0].lockingBytecode == new LockingBytecodeP2PKH(supporteePkh), "settle: supportee payment destination");
         require(tx.outputs[0].tokenCategory == fundsCategory, "settle: supportee payment category");
-        require(tx.outputs[0].tokenAmount == paid, "settle: supportee payment amount");
+        require(tx.outputs[0].tokenAmount == gross - fee, "settle: supportee payment amount");
+        require(tx.outputs[1].lockingBytecode == new LockingBytecodeP2PKH(servicePkh), "settle: service payment destination");
+        require(tx.outputs[1].tokenCategory == fundsCategory, "settle: service payment category");
+        require(tx.outputs[1].tokenAmount == fee, "settle: service payment amount");
     }
-    return lastPeriodTime + m * period, amountNext, periodNext, paid, n, m;
+    return lastPeriodTime + m * period, amountNext, periodNext, gross, n, m;
 }
 
 // -----------------------------------------------------------------------------
@@ -244,12 +301,20 @@ function paymentOk(int idx, bytes20 pkh, bytes32 fundsCategory, int amount) retu
     return true;
 }
 
-// Outputs past the ones the contract mandates may exist (a BCH change output,
-// typically), but they must not carry any token — otherwise a spend could
-// silently leak subscription funds.
-function noTokenTail(int fromIndex) returns (bool) {
+// Foreign-token cleanup (design.md § Security Notes — stranded funds and foreign
+// tokens). Outputs past the ones the contract mandates may exist (a BCH change
+// output, typically), but they must not carry the state or funds category. A
+// token of any OTHER category is allowed only when routed to `supporterPkh`, so a
+// mis-sent token can be cleared instead of dying with the NFT. The state-category
+// check is evaluated FIRST so the state NFT can never be routed out.
+function tailOk(int fromIndex, bytes32 fundsCategory, bytes32 stateCategory, bytes20 supporterPkh) returns (bool) {
     for (int i = fromIndex; i < tx.outputs.length; i++) {
-        require(tx.outputs[i].tokenCategory == 0x, "extra output must not carry tokens");
+        bytes cat = tx.outputs[i].tokenCategory;
+        if (cat != 0x) {
+            require(!isCategoryOf(stateCategory, cat), "tail: state category must not be routed out");
+            require(!isCategoryOf(fundsCategory, cat), "tail: funds category must not be in the tail");
+            require(tx.outputs[i].lockingBytecode == new LockingBytecodeP2PKH(supporterPkh), "tail: foreign token must go to the supporter");
+        }
     }
     return true;
 }
@@ -261,43 +326,42 @@ function noTokenTail(int fromIndex) returns (bool) {
 contract TokenSubscription(bytes32 stateCategory) {
 
     // -------------------------------------------------------------------------
-    // pull — permissionless, n-period catch-up, recreates the covenant
+    // pull — permissionless, m-period catch-up, recreates the covenant
     // -------------------------------------------------------------------------
     function pull() {
         bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
         (
             bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
             int amount, int amountNext, int period, int periodNext,
             int lastPeriodTime, int mode, bytes32 fundsCat
-        ) = readState(tx.inputs[stateInputIndex(stateCategory, contractLock)].nftCommitment);
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
         require(fundsCat != stateCategory, "pull: categories must differ");
+        int escrowIdx = escrowInputIndex(stateIdx, fundsCat, contractLock);
 
         require(tx.time >= lastPeriodTime + period, "pull: period has not elapsed yet");
 
-        int balance = totalIn(fundsCat);
+        int escrow = tx.inputs[escrowIdx].tokenAmount;
+        int spendable = escrow - SEED;
         int newLastPeriodTime = lastPeriodTime;
         int newAmount = amount;
         int newPeriod = period;
-        int paid = 0;
+        int gross = 0;
         (
-            newLastPeriodTime, newAmount, newPeriod, paid, int unused n, int unused m
-        ) = settle(supporteePkh, amount, amountNext, period, periodNext, lastPeriodTime, balance, fundsCat);
+            newLastPeriodTime, newAmount, newPeriod, gross, int unused n, int unused m
+        ) = settle(supporteePkh, servicePkh, amount, amountNext, period, periodNext, lastPeriodTime, spendable, fundsCat);
         // Gate from `settle()`: a settlement that pays nothing must not happen —
         // an underfunded subscription can never advance its clock.
-        require(paid > 0, "pull: balance does not cover a period");
+        require(gross > 0, "pull: balance does not cover a period");
 
-        int idx = 1;
-        if (balance - paid > 0) {
-            require(fundsOk(2, contractLock, fundsCat, balance - paid), "pull: bad funds output");
-            idx = 3;
-        } else {
-            idx = 2;
-        }
-        require(stateOk(1, contractLock, stateCategory, writeState(
+        // The seed is retained, so `escrow − gross ≥ SEED ≥ 1` always: the funds
+        // output is always recreated (no empty-escrow layout branch).
+        require(fundsOk(3, contractLock, fundsCat, escrow - gross), "pull: bad funds output");
+        require(stateOk(2, contractLock, stateCategory, writeState(
             supporterPkh, supporteePkh, servicePkh, newAmount, amountNext,
             newPeriod, periodNext, newLastPeriodTime, mode, fundsCat
         )), "pull: bad state output");
-        require(noTokenTail(idx), "pull: extra outputs");
+        require(tailOk(4, fundsCat, stateCategory, supporterPkh), "pull: extra outputs");
     }
 
     // -------------------------------------------------------------------------
@@ -305,12 +369,14 @@ contract TokenSubscription(bytes32 stateCategory) {
     // -------------------------------------------------------------------------
     function cancel() {
         bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
         (
             bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
             int amount, int amountNext, int period, int periodNext,
             int lastPeriodTime, int unused mode, bytes32 fundsCat
-        ) = readState(tx.inputs[stateInputIndex(stateCategory, contractLock)].nftCommitment);
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
         require(fundsCat != stateCategory, "cancel: categories must differ");
+        int escrowIdx = escrowInputIndex(stateIdx, fundsCat, contractLock);
 
         require(tx.time >= lastPeriodTime + period, "cancel: boundary not reached");
         require(
@@ -318,23 +384,26 @@ contract TokenSubscription(bytes32 stateCategory) {
             "cancel: unauthorised"
         );
 
-        int balance = totalIn(fundsCat);
-        int paid = 0;
+        int escrow = tx.inputs[escrowIdx].tokenAmount;
+        int spendable = escrow - SEED;
+        int gross = 0;
         (
             int unused settledAnchor, int unused promotedAmount, int unused promotedPeriod,
-            paid, int unused n, int unused m
-        ) = settle(supporteePkh, amount, amountNext, period, periodNext, lastPeriodTime, balance, fundsCat);
+            gross, int unused n, int unused m
+        ) = settle(supporteePkh, servicePkh, amount, amountNext, period, periodNext, lastPeriodTime, spendable, fundsCat);
+
+        // Refund is everything remaining after the settlement (seed + strays):
+        // `totalIn` folds the escrow remainder and any stray funds UTXO together.
+        int total = totalIn(fundsCat);
+        int refund = total - gross;
 
         int idx = 0;
-        if (paid > 0) {
-            idx = 1;
+        if (gross > 0) {
+            idx = 2;
         }
-        if (balance - paid > 0) {
-            // Everything left after the settlement goes back to the supporter.
-            require(paymentOk(idx, supporterPkh, fundsCat, balance - paid), "cancel: bad refund output");
-            idx = idx + 1;
-        }
-        require(noTokenTail(idx), "cancel: extra outputs");
+        require(paymentOk(idx, supporterPkh, fundsCat, refund), "cancel: bad refund output");
+        idx = idx + 1;
+        require(tailOk(idx, fundsCat, stateCategory, supporterPkh), "cancel: extra outputs");
         // The state NFT must be burned: no output may carry the state category
         // under any capability — a mutable NFT can legally be *downgraded* to an
         // immutable one, which would otherwise keep a frozen covenant alive.
@@ -350,12 +419,14 @@ contract TokenSubscription(bytes32 stateCategory) {
         require(newAmountNext > 0, "modify: amountNext must be positive");
         require(newPeriodNext > 0, "modify: periodNext must be positive");
         bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
         (
             bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
             int amount, int unused amountNext, int period, int unused periodNext,
             int lastPeriodTime, int mode, bytes32 fundsCat
-        ) = readState(tx.inputs[stateInputIndex(stateCategory, contractLock)].nftCommitment);
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
         require(fundsCat != stateCategory, "modify: categories must differ");
+        int unused escrowIdx = escrowInputIndex(stateIdx, fundsCat, contractLock);
 
         require(
             isPresent(supporterPkh) && isPresent(supporteePkh),
@@ -367,12 +438,8 @@ contract TokenSubscription(bytes32 stateCategory) {
             supporterPkh, supporteePkh, servicePkh, amount, newAmountNext,
             period, newPeriodNext, lastPeriodTime, mode, fundsCat
         )), "modify: bad state output");
-        int idx = 1;
-        if (balance > 0) {
-            require(fundsOk(1, contractLock, fundsCat, balance), "modify: bad funds output");
-            idx = 2;
-        }
-        require(noTokenTail(idx), "modify: extra outputs");
+        require(fundsOk(1, contractLock, fundsCat, balance), "modify: bad funds output");
+        require(tailOk(2, fundsCat, stateCategory, supporterPkh), "modify: extra outputs");
     }
 
     // -------------------------------------------------------------------------
@@ -380,12 +447,14 @@ contract TokenSubscription(bytes32 stateCategory) {
     // -------------------------------------------------------------------------
     function setPkh(bytes20 newSupporterPkh, bytes20 newSupporteePkh, bytes20 newServicePkh) {
         bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
         (
             bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
             int amount, int amountNext, int period, int periodNext,
             int lastPeriodTime, int mode, bytes32 fundsCat
-        ) = readState(tx.inputs[stateInputIndex(stateCategory, contractLock)].nftCommitment);
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
         require(fundsCat != stateCategory, "setPkh: categories must differ");
+        int unused escrowIdx = escrowInputIndex(stateIdx, fundsCat, contractLock);
 
         // Exactly one role moves, authorised solely by its current holder. The
         // two untouched hashes are carried through as-is, so a cross-role edit
@@ -410,12 +479,8 @@ contract TokenSubscription(bytes32 stateCategory) {
             newSupporterPkh, newSupporteePkh, newServicePkh, amount, amountNext,
             period, periodNext, lastPeriodTime, mode, fundsCat
         )), "setPkh: bad state output");
-        int idx = 1;
-        if (balance > 0) {
-            require(fundsOk(1, contractLock, fundsCat, balance), "setPkh: bad funds output");
-            idx = 2;
-        }
-        require(noTokenTail(idx), "setPkh: extra outputs");
+        require(fundsOk(1, contractLock, fundsCat, balance), "setPkh: bad funds output");
+        require(tailOk(2, fundsCat, stateCategory, supporterPkh), "setPkh: extra outputs");
     }
 
     // -------------------------------------------------------------------------
@@ -423,15 +488,17 @@ contract TokenSubscription(bytes32 stateCategory) {
     // -------------------------------------------------------------------------
     function fund() {
         bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
         (
             bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
             int amount, int amountNext, int period, int periodNext,
             int lastPeriodTime, int mode, bytes32 fundsCat
-        ) = readState(tx.inputs[stateInputIndex(stateCategory, contractLock)].nftCommitment);
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
         require(fundsCat != stateCategory, "fund: categories must differ");
+        int unused escrowIdx = escrowInputIndex(stateIdx, fundsCat, contractLock);
 
-        // `totalIn` covers the covenant's existing funds UTXO _and_ whatever the
-        // funder contributes — the whole lot is locked back into the covenant.
+        // `totalIn` covers the covenant's existing escrow _and_ whatever the
+        // funder contributes — strays included — the whole lot is locked back in.
         int total = totalIn(fundsCat);
         require(total > 0, "fund: nothing to fund");
         require(stateOk(0, contractLock, stateCategory, writeState(
@@ -439,118 +506,137 @@ contract TokenSubscription(bytes32 stateCategory) {
             period, periodNext, lastPeriodTime, mode, fundsCat
         )), "fund: bad state output");
         require(fundsOk(1, contractLock, fundsCat, total), "fund: bad funds output");
-        require(tx.outputs.length >= 2, "fund: missing outputs");
-        require(noTokenTail(2), "fund: extra outputs");
+        require(tailOk(2, fundsCat, stateCategory, supporterPkh), "fund: extra outputs");
     }
 
     // -------------------------------------------------------------------------
-    // withdraw — settle, then reclaim `balance − reserved` (earned periods stay)
+    // withdraw — settle, then reclaim `spendable − owedPreSettle` (earned stays)
     // -------------------------------------------------------------------------
     function withdraw() {
         bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
         (
             bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
             int amount, int amountNext, int period, int periodNext,
             int lastPeriodTime, int mode, bytes32 fundsCat
-        ) = readState(tx.inputs[stateInputIndex(stateCategory, contractLock)].nftCommitment);
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
         require(fundsCat != stateCategory, "withdraw: categories must differ");
+        int escrowIdx = escrowInputIndex(stateIdx, fundsCat, contractLock);
 
         require(isPresent(supporterPkh), "withdraw: supporter presence required");
 
-        int balance = totalIn(fundsCat);
+        int escrow = tx.inputs[escrowIdx].tokenAmount;
+        int spendable = escrow - SEED;
         int newLastPeriodTime = lastPeriodTime;
         int newAmount = amount;
         int newPeriod = period;
-        int paid = 0;
+        int gross = 0;
         int n = 0;
         (
-            newLastPeriodTime, newAmount, newPeriod, paid, n, int unused m
-        ) = settle(supporteePkh, amount, amountNext, period, periodNext, lastPeriodTime, balance, fundsCat);
+            newLastPeriodTime, newAmount, newPeriod, gross, n, int unused m
+        ) = settle(supporteePkh, servicePkh, amount, amountNext, period, periodNext, lastPeriodTime, spendable, fundsCat);
 
-        // reserved = amount · (n + mode): every period the supportee has earned
-        // so far, plus — in mode B — the escrowed upcoming period.
-        int reserved = amount * (n + mode);
-        require(balance >= reserved, "withdraw: balance is below the reserved amount");
+        // owedPreSettle = amount · (n + mode): every period the supportee has
+        // earned so far, plus — in mode B — the escrowed upcoming period. This is
+        // the PRE-settle entitlement (the full `n`); settle pays `m` of those
+        // periods, so what stays locked is `owedPreSettle − gross`. (Do not
+        // confuse it with `migrate`'s `carryOver`, the POST-settle floor.)
+        int owedPreSettle = amount * (n + mode);
+        require(spendable >= owedPreSettle, "withdraw: balance is below the reserved amount");
 
-        // Anything above `reserved` is unearned and belongs to the supporter;
-        // `reserved − paid` stays locked up for the supportee.
-        int remaining = balance - paid;
-        int retained = reserved - paid;
-        require(remaining >= retained, "withdraw: internal accounting error");
-        int payout = remaining - retained;
+        // The supporter may take `spendable − owedPreSettle`; the covenant retains
+        // `(owedPreSettle − gross) + SEED` — the supportee's remaining entitlement
+        // plus the seed, so the escrow UTXO always survives.
+        int retained = (owedPreSettle - gross) + SEED;
+        int payout = (escrow - gross) - retained;
+        // Strays are swept into the supporter's payout.
+        int strays = totalIn(fundsCat) - escrow;
+        int supporterOut = payout + strays;
 
-        int idx = 0;
-        if (paid > 0) {
-            idx = 1;
+        int idx = 2;
+        if (gross > 0) {
+            idx = 4;
         }
-        require(stateOk(idx, contractLock, stateCategory, writeState(
+        require(stateOk(idx - 2, contractLock, stateCategory, writeState(
             supporterPkh, supporteePkh, servicePkh, newAmount, amountNext,
             newPeriod, periodNext, newLastPeriodTime, mode, fundsCat
         )), "withdraw: bad state output");
+        require(fundsOk(idx - 1, contractLock, fundsCat, retained), "withdraw: bad funds output");
+        require(paymentOk(idx, supporterPkh, fundsCat, supporterOut), "withdraw: bad payout output");
         idx = idx + 1;
-        if (retained > 0) {
-            require(fundsOk(idx, contractLock, fundsCat, retained), "withdraw: bad funds output");
-            idx = idx + 1;
-        }
-        if (payout > 0) {
-            require(paymentOk(idx, supporterPkh, fundsCat, payout), "withdraw: bad payout output");
-            idx = idx + 1;
-        }
-        require(noTokenTail(idx), "withdraw: extra outputs");
+        require(tailOk(idx, fundsCat, stateCategory, supporterPkh), "withdraw: extra outputs");
     }
 
     // -------------------------------------------------------------------------
-    // reactivate — only while in arrears: settle, then re-anchor the clock.
-    // This is the ONLY function in the contract that ever forgives arrears.
+    // reactivate — only while in arrears: pay the whole escrow except the seed,
+    // waive the rest, promote terms, stay on the grid. This is the ONLY function
+    // in the contract that ever forgives arrears, and it does NOT call `settle()`.
     // -------------------------------------------------------------------------
     function reactivate() {
         bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
         (
             bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
             int amount, int amountNext, int period, int periodNext,
             int lastPeriodTime, int mode, bytes32 fundsCat
-        ) = readState(tx.inputs[stateInputIndex(stateCategory, contractLock)].nftCommitment);
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
         require(fundsCat != stateCategory, "reactivate: categories must differ");
+        int escrowIdx = escrowInputIndex(stateIdx, fundsCat, contractLock);
 
         require(isPresent(supporterPkh), "reactivate: supporter presence required");
         require(tx.locktime >= lastPeriodTime, "reactivate: locktime is before the anchor");
 
-        // Arrears gate, evaluated BEFORE settle: paused ⟺ balance < payable.
-        // At least one full period must be funded, so a reactivation always costs
-        // something and can never be used to reset a dust balance for free.
-        int payable = amount * ((tx.locktime - lastPeriodTime) / period);
-        int balance = totalIn(fundsCat);
-        require(balance < payable, "reactivate: rejected while funded");
-        require(balance >= amount, "reactivate: at least one period must be funded");
+        int escrow = tx.inputs[escrowIdx].tokenAmount;
+        int total = totalIn(fundsCat);
+        int newFunds = total - escrow;
 
-        int newAmount = amount;
-        int newPeriod = period;
-        int paid = 0;
-        (
-            int unused settledAnchor, newAmount, newPeriod, paid, int unused n, int unused m
-        ) = settle(supporteePkh, amount, amountNext, period, periodNext, lastPeriodTime, balance, fundsCat);
+        // Arrears gate, evaluated BEFORE any payment: paused ⟺ escrow < payable.
+        // The fresh period is the *upcoming* period, so it is gated at the
+        // upcoming rate (`amountNext`), not the rate of the periods just ended.
+        int n = (tx.locktime - lastPeriodTime) / period;
+        int payable = amount * n;
+        require(escrow < payable, "reactivate: rejected while funded");
+        require(newFunds >= amountNext, "reactivate: at least one fresh period must be funded");
 
-        // Whatever the balance could not cover is waived: the clock is re-anchored
-        // to the present, so the subscription restarts with n = 0. The `balance ≥
-        // amount` gate above already guarantees reactivation costs something; the
-        // remainder after settling is whatever is left to fund the fresh clock
-        // (possibly zero if the whole balance was just consumed paying arrears).
-        int remaining = balance - paid;
+        // Pay the whole escrow except the seed (gross); the service fee is carved
+        // out of it, per period paid, each at the rate in force when it was paid.
+        // Mode B's fresh period is escrowed and pays its fee at the boundary
+        // `pull`, never here, so it adds nothing to the fee now.
+        int spendable = escrow - SEED;
+        int m = spendable / amount;
+        int fee = m * perPeriodFee(amount);
+        int prepaid = 0;
+        int contractBalance = SEED + newFunds;
+        if (mode == 0) {
+            fee = fee + perPeriodFee(amountNext);
+            prepaid = amountNext;
+            contractBalance = SEED + newFunds - amountNext;
+        }
+        int supporteeAmount = spendable + prepaid - fee;
+
+        // Advance on the grid (waives the unpaid remainder, no drift) and promote
+        // terms so the fresh period is priced at the new rate.
+        int newAnchor = lastPeriodTime + n * period;
+        int newAmount = amountNext;
+        int newPeriod = periodNext;
 
         int idx = 0;
-        if (paid > 0) {
+        if (supporteeAmount > 0) {
+            require(paymentOk(0, supporteePkh, fundsCat, supporteeAmount), "reactivate: bad supportee output");
             idx = 1;
+        }
+        if (fee > 0) {
+            require(paymentOk(idx, servicePkh, fundsCat, fee), "reactivate: bad service output");
+            idx = idx + 1;
         }
         require(stateOk(idx, contractLock, stateCategory, writeState(
             supporterPkh, supporteePkh, servicePkh, newAmount, amountNext,
-            newPeriod, periodNext, tx.locktime, mode, fundsCat
+            newPeriod, periodNext, newAnchor, mode, fundsCat
         )), "reactivate: bad state output");
         idx = idx + 1;
-        if (remaining > 0) {
-            require(fundsOk(idx, contractLock, fundsCat, remaining), "reactivate: bad funds output");
-            idx = idx + 1;
-        }
-        require(noTokenTail(idx), "reactivate: extra outputs");
+        require(fundsOk(idx, contractLock, fundsCat, contractBalance), "reactivate: bad funds output");
+        idx = idx + 1;
+        require(tailOk(idx, fundsCat, stateCategory, supporterPkh), "reactivate: extra outputs");
     }
 
     // -------------------------------------------------------------------------
@@ -561,64 +647,72 @@ contract TokenSubscription(bytes32 stateCategory) {
         require(newAmountNext > 0, "migrate: amountNext must be positive");
         require(newFundsCategory != stateCategory, "migrate: new category is the state category");
         bytes contractLock = tx.inputs[this.activeInputIndex].lockingBytecode;
+        int stateIdx = stateInputIndex(stateCategory, contractLock);
         (
             bytes20 supporterPkh, bytes20 supporteePkh, bytes20 servicePkh,
             int amount, int amountNext, int period, int periodNext,
             int lastPeriodTime, int mode, bytes32 fundsCat
-        ) = readState(tx.inputs[stateInputIndex(stateCategory, contractLock)].nftCommitment);
+        ) = readState(tx.inputs[stateIdx].nftCommitment);
         require(fundsCat != stateCategory, "migrate: old categories must differ");
         require(newFundsCategory != fundsCat, "migrate: nothing to migrate");
+        int escrowIdx = escrowInputIndex(stateIdx, fundsCat, contractLock);
 
         require(
             isPresent(supporterPkh) && isPresent(supporteePkh),
             "migrate: supporter and supportee must both be present"
         );
 
-        int balance = totalIn(fundsCat);
-        // `totalIn` returns the old-asset balance; the new-asset input (added by
-        // the supporter in the same transaction) is counted separately below.
-        int paid = 0;
+        int escrow = tx.inputs[escrowIdx].tokenAmount;
+        int spendable = escrow - SEED;
+        int gross = 0;
         int n = 0;
         int m = 0;
         int settledAnchor = 0;
         (
             settledAnchor, int unused promotedAmount, int unused promotedPeriod,
-            paid, n, m
-        ) = settle(supporteePkh, amount, amountNext, period, periodNext, lastPeriodTime, balance, fundsCat);
+            gross, n, m
+        ) = settle(supporteePkh, servicePkh, amount, amountNext, period, periodNext, lastPeriodTime, spendable, fundsCat);
 
         // The new escrow must cover what the supportee is still owed under the
         // new denomination: the arrears that survive the settle (`n − m` periods)
-        // plus, in mode B, the escrowed upcoming period. The contract cannot
-        // verify an exchange rate (there is no oracle), so this bound is the only
-        // fairness the chain can enforce; the supportee's consent — plus the
-        // presence checks above — is the actual safeguard (design.md § Security).
-        // What settle already paid out of the OLD asset is behind us, so only the
-        // not-yet-paid portion of `reserved` has to be funded in the new asset.
-        int reserved = newAmount * ((n - m) + mode);
+        // plus, in mode B, the escrowed upcoming period — AND the seed, so the
+        // recreated state NFT always has a co-created escrow (a 0-unit token
+        // output is not a token UTXO, so without the seed the sub would be
+        // bricked). The contract cannot verify an exchange rate (there is no
+        // oracle), so this bound is the only fairness the chain can enforce; the
+        // supportee's consent — plus the presence checks above — is the actual
+        // safeguard (design.md Security).
+        //
+        // `carryOver` is the POST-settle floor (the surviving `n − m`), which is a
+        // different quantity from `withdraw`'s pre-settle `owedPreSettle`
+        // (`amount · (n + mode)`). They collapse to the same retained balance —
+        // `owedPreSettle − gross == amount · (n − m + mode)` — because settle has
+        // already paid the `m` periods; only the denomination differs here.
+        int carryOver = newAmount * ((n - m) + mode);
         int newEscrow = totalIn(newFundsCategory);
-        require(newEscrow >= reserved - paid, "migrate: new escrow below the reserved amount");
+        require(newEscrow >= carryOver + SEED, "migrate: new escrow below the reserved amount");
+
+        // The unearned remainder of the old asset goes back to the supporter,
+        // computed from the old-asset balance left after the settle.
+        int oldRemainder = totalIn(fundsCat) - gross;
 
         int idx = 0;
-        if (paid > 0) {
-            idx = 1;
+        if (gross > 0) {
+            idx = 2;
         }
         require(stateOk(idx, contractLock, stateCategory, writeState(
             supporterPkh, supporteePkh, servicePkh, newAmount, newAmountNext,
             period, periodNext, settledAnchor, mode, newFundsCategory
         )), "migrate: bad state output");
         idx = idx + 1;
-        if (newEscrow > 0) {
-            require(fundsOk(idx, contractLock, newFundsCategory, newEscrow), "migrate: bad funds output");
-            idx = idx + 1;
-        }
-        // The unearned remainder of the old asset goes back to the supporter. This
-        // is computed from the balance left after the settle.
-        int oldRemainder = balance - paid;
+        // The funds output is ALWAYS recreated (newEscrow ≥ SEED ≥ 1), so the
+        // co-creation invariant holds after the swap.
+        require(fundsOk(idx, contractLock, newFundsCategory, newEscrow), "migrate: bad funds output");
+        idx = idx + 1;
         if (oldRemainder > 0) {
             require(paymentOk(idx, supporterPkh, fundsCat, oldRemainder), "migrate: bad old-asset output");
             idx = idx + 1;
         }
-        // Outputs from `idx` onward (the optional BCH change) must carry no token.
-        require(noTokenTail(idx), "migrate: extra outputs");
+        require(tailOk(idx, fundsCat, stateCategory, supporterPkh), "migrate: extra outputs");
     }
 }

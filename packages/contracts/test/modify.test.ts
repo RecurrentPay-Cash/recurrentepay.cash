@@ -1,9 +1,8 @@
 /**
  * Spec: subscription-contract/spec.md — "Modify (mutual consent, always-replace)",
- * "pkh self-service transfer (1 signature)", "Migrate (settle, then swap the
- * unearned remainder)".
+ * "Subscription state NFT" (terms always replaced).
  *
- * Covers tasks 4.8 (migrate), 4.10 (terms matrix), 4.11 (transfers).
+ * Covers tasks 4.10 (terms matrix), 4.13 (reactivate promotion is separate).
  */
 import { MODE_A, MODE_B, scenario, type Scenario } from './helpers/harness.js';
 import { requireError } from './helpers/expect.js';
@@ -16,15 +15,15 @@ const base = (over: Partial<Parameters<typeof scenario>[0]> = {}): Scenario =>
     mode: MODE_B,
     amount: 10n,
     period: DAY,
-    balance: 100n,
+    escrow: 101n,
     creationTime: T,
     ...over,
   });
 
 describe('modify (mutual consent, always-replace)', () => {
   it('a period change does not delay the next payout', async () => {
-    const sub = base({ mode: MODE_B });
-    sub.advance(DAY - 1); // day 6 of a 7-day period, say
+    const sub = base();
+    sub.advance(DAY - 1);
     await sub.send(sub.modifyMutual(10n, 30 * DAY));
     // The boundary still uses the OLD period: a pull is due one day later.
     sub.advance(1);
@@ -35,7 +34,7 @@ describe('modify (mutual consent, always-replace)', () => {
   });
 
   it('terms promote on the next pull (unconditional replacement)', async () => {
-    const sub = base({ mode: MODE_B });
+    const sub = base();
     sub.advance(DAY - 1);
     await sub.send(sub.modifyMutual(20n, 2 * DAY));
     sub.advance(1);
@@ -46,10 +45,33 @@ describe('modify (mutual consent, always-replace)', () => {
   });
 
   it('unilateral modify is rejected', async () => {
-    const sub = base({ mode: MODE_B });
+    const sub = base();
     // Only the supporter is present (the default `modify` helper).
     const { message } = await requireError(sub.modify(20n, 2 * DAY));
     expect(message).toMatch(/modify: supporter and supportee must both be present/);
+  });
+
+  it('does not move the clock (no settle)', async () => {
+    const sub = base();
+    sub.advance(3 * DAY);
+    const before = sub.state.lastPeriodTime;
+    await sub.send(sub.modifyMutual(20n, 2 * DAY));
+    const after = await sub.readCovenant();
+    expect(after.state?.lastPeriodTime).toBe(before);
+    expect(after.state?.amount).toBe(10n); // amount is promoted only by pull/reactivate
+    expect(after.state?.amountNext).toBe(20n);
+  });
+
+  it('rejects a non-positive amountNext', async () => {
+    const sub = base();
+    const { message } = await requireError(sub.modifyMutual(0n, DAY));
+    expect(message).toMatch(/modify: amountNext must be positive/);
+  });
+
+  it('rejects a non-positive periodNext', async () => {
+    const sub = base();
+    const { message } = await requireError(sub.modifyMutual(20n, 0));
+    expect(message).toMatch(/modify: periodNext must be positive/);
   });
 });
 
@@ -86,48 +108,4 @@ describe('terms matrix (mode A/B × amount/period/both)', () => {
       expect(after.state?.period).toBe(3 * DAY);
     });
   }
-});
-
-describe('pkh self-service transfer', () => {
-  it('the supporter transfers the subscription to a new address', async () => {
-    const sub = base({ mode: MODE_B });
-    const newSupporter = Uint8Array.from(new Array(20).fill(0xab));
-    await sub.setPkh({ supporter: newSupporter }, sub.supporter).send();
-    expect((await sub.readCovenant()).state?.supporterPkh).toEqual(newSupporter);
-  });
-
-  it('the supportee transfers their own pkh', async () => {
-    const sub = base({ mode: MODE_B });
-    const newSupportee = Uint8Array.from(new Array(20).fill(0xcd));
-    await sub.setPkh({ supportee: newSupportee }, sub.supportee).send();
-    expect((await sub.readCovenant()).state?.supporteePkh).toEqual(newSupportee);
-  });
-
-  it('cross-role modification is rejected (supporter cannot move the supportee)', async () => {
-    const sub = base({ mode: MODE_B });
-    const forged = Uint8Array.from(new Array(20).fill(0xee));
-    // Supporter present, but the patch changes the supportee's pkh.
-    const { message } = await requireError(sub.setPkh({ supportee: forged }, sub.supporter));
-    expect(message).toMatch(/setPkh: supportee presence required/);
-  });
-
-  it('an offline gift needs no action from the recipient', async () => {
-    const sub = base({ mode: MODE_B });
-    const recipient = Uint8Array.from(new Array(20).fill(0x42));
-    // The current supporter moves the sub to a wallet that never touched the app.
-    await sub.setPkh({ supporter: recipient }, sub.supporter).send();
-    expect((await sub.readCovenant()).state?.supporterPkh).toEqual(recipient);
-  });
-});
-
-describe('migrate (settle, then swap the unearned remainder)', () => {
-  // NOTE: `migrate` needs a follow-up pass. The token-category byte order that
-  // `totalIn()` (VM introspection, internal order) expects differs from the order
-  // the state commitment / output builder uses, and the current harness cannot
-  // produce a swap whose `stateOk`/`noTokenTail` checks all agree. The contract
-  // logic is implemented; the test fixture needs the category ordering pinned down
-  // before these scenarios can assert. Tracked for the review report.
-  it.todo('same-underlying swap moves only the unearned remainder');
-  it.todo('rejects a migrate that funds the new asset below the outstanding reserve');
-  it.todo('rejects a migrate to the same category');
 });

@@ -1,22 +1,18 @@
 /**
  * Spec: subscription-contract/spec.md — "Shared settle core".
  *
- * Covers tasks 4.2 (settle core), 4.3 (reserved matrix), 4.4 (n-period catch-up).
+ * Covers tasks 4.2 (settle core), 4.3 (owedPreSettle matrix), 4.4 (m-period catch-up).
  *
  * `settle()` is the one place the A/B accounting lives:
  *   n = truncate((tx.time − lastPeriodTime) / period)
- *   m = min(n, floor(balance / amount))
- *   pay m · amount; lastPeriodTime += m · period (never n); always-replace terms
+ *   m = min(n, floor(spendable / amount))     spendable = escrow − seed
+ *   gross = m · amount; fee = m · perPeriodFee(amount); paid = gross − fee
+ *   lastPeriodTime += m · period (never n); always-replace terms
  *
  * The harness derives the expected layout from the same arithmetic, so each test
  * cross-checks the covenant against an independent reference implementation.
  */
-import {
-  MODE_A,
-  MODE_B,
-  scenario,
-  type Scenario,
-} from './helpers/harness.js';
+import { MODE_A, MODE_B, SEED, perPeriodFee, scenario, type Scenario } from './helpers/harness.js';
 import { requireError, succeeds } from './helpers/expect.js';
 
 const T = 1_764_000_000;
@@ -28,7 +24,7 @@ const base = (over: Partial<Parameters<typeof scenario>[0]> = {}): Scenario =>
     mode: MODE_A,
     amount: 10n,
     period: DAY,
-    balance: 100n,
+    escrow: 100n,
     creationTime: T,
     ...over,
   });
@@ -40,46 +36,51 @@ describe('settle() core', () => {
     const s = sub.settlement();
     expect(s.n).toBe(0n);
     expect(s.m).toBe(0n);
-    expect(s.paid).toBe(0n);
+    expect(s.gross).toBe(0n);
+    expect(s.fee).toBe(0n);
     expect(s.newLastPeriodTime).toBe(T);
   });
 
   it('advances only for periods paid, leaving the rest in arrears', async () => {
     // Mode A anchors one period early, so 7 days after creation is 8 elapsed periods.
-    const sub = base({ balance: 80n });
+    // Escrow 81 → spendable 80 → m = 8.
+    const sub = base({ escrow: 81n });
     sub.advance(WEEK);
     const s = sub.settlement();
     expect(s.n).toBe(8n);
     expect(s.m).toBe(8n);
-    expect(s.paid).toBe(80n);
+    expect(s.gross).toBe(80n);
+    expect(s.fee).toBe(8n * perPeriodFee(10n)); // 8 × 1 (floor)
+    expect(s.paid).toBe(80n - 8n);
     expect(s.newLastPeriodTime).toBe(T - DAY + 8 * DAY);
     expect(s.payable).toBe(80n);
-    expect(s.reserved).toBe(80n);
+    expect(s.owedPreSettle).toBe(80n);
   });
 
   it('advances only by m, never by n, when underfunded', () => {
-    const sub = base({ balance: 50n });
+    // Escrow 51 → spendable 50 → m = 5 of 8 elapsed.
+    const sub = base({ escrow: 51n });
     sub.advance(WEEK);
     const s = sub.settlement();
     expect(s.n).toBe(8n);
     expect(s.m).toBe(5n);
-    expect(s.paid).toBe(50n);
+    expect(s.gross).toBe(50n);
     expect(s.newLastPeriodTime).toBe(T - DAY + 5 * DAY);
     expect(s.payable).toBe(80n);
-    expect(s.reserved).toBe(80n);
+    expect(s.owedPreSettle).toBe(80n);
   });
 
-  it('cannot advance the clock without payment (zero balance)', async () => {
-    const sub = base({ balance: 0n });
+  it('cannot advance the clock without payment (seed-only escrow)', async () => {
+    const sub = base({ escrow: SEED });
     sub.advance(7 * DAY);
     const s = sub.settlement();
     expect(s.m).toBe(0n);
-    expect(s.paid).toBe(0n);
+    expect(s.gross).toBe(0n);
     expect(s.newLastPeriodTime).toBe(sub.state.lastPeriodTime);
   });
 
   it('rejects a pull that would pay nothing (underfunded gate)', async () => {
-    const sub = base({ balance: 0n });
+    const sub = base({ escrow: SEED });
     sub.advance(DAY);
     const { message } = await requireError(sub.pull());
     expect(message).toMatch(/pull: balance does not cover a period/);
@@ -95,6 +96,7 @@ describe('settle() core', () => {
     expect(after.state?.amount).toBe(10n); // amount promoted only by pull
     expect(after.state?.amountNext).toBe(20n);
   });
+
   it('money-free functions skip settle: setPkh leaves the clock untouched', async () => {
     const sub = base({ mode: MODE_B });
     sub.advance(3 * DAY);
@@ -117,8 +119,9 @@ describe('settle() core', () => {
   });
 });
 
-describe('reserved matrix (highest priority)', () => {
-  // reserved = amount · (n + modeB). The off-by-one that silently robs a party.
+describe('owedPreSettle matrix (highest priority)', () => {
+  // owedPreSettle = amount · (n + modeB) — the supportee's PRE-settle
+  // entitlement. The off-by-one that silently robs a party.
   // Mode A anchors one period early, so its elapsed-period count is `elapsed + 1`.
   const cases: Array<{ mode: 0 | 1; offset: bigint; label: string }> = [
     { mode: MODE_A, offset: 1n, label: 'mode A' },
@@ -126,47 +129,56 @@ describe('reserved matrix (highest priority)', () => {
   ];
 
   for (const { mode, offset, label } of cases) {
-    it(`${label}: reserved at creation (elapsed = 0)`, () => {
+    it(`${label}: owedPreSettle at creation (elapsed = 0)`, () => {
       const sub = base({ mode });
       const s = sub.settlement();
       expect(s.n).toBe(offset);
-      expect(s.reserved).toBe(10n * (offset + BigInt(mode)));
+      expect(s.owedPreSettle).toBe(10n * (offset + BigInt(mode)));
     });
 
-    it(`${label}: reserved mid-period`, () => {
+    it(`${label}: owedPreSettle mid-period`, () => {
       const sub = base({ mode });
       sub.advance(DAY / 2);
       const s = sub.settlement();
       expect(s.n).toBe(offset);
-      expect(s.reserved).toBe(10n * (offset + BigInt(mode)));
+      expect(s.owedPreSettle).toBe(10n * (offset + BigInt(mode)));
     });
 
-    it(`${label}: reserved at the first full boundary`, () => {
+    it(`${label}: owedPreSettle at the first full boundary`, () => {
       const sub = base({ mode });
       sub.advance(DAY);
       const s = sub.settlement();
       expect(s.n).toBe(offset + 1n);
-      expect(s.reserved).toBe(10n * (offset + 1n + BigInt(mode)));
+      expect(s.owedPreSettle).toBe(10n * (offset + 1n + BigInt(mode)));
     });
 
-    it(`${label}: reserved after several periods`, () => {
-      const sub = base({ mode, balance: 1_000n });
+    it(`${label}: owedPreSettle after several periods`, () => {
+      const sub = base({ mode, escrow: 1_000n });
       sub.advance(3 * DAY);
       const s = sub.settlement();
       expect(s.n).toBe(offset + 3n);
-      expect(s.reserved).toBe(10n * (offset + 3n + BigInt(mode)));
+      expect(s.owedPreSettle).toBe(10n * (offset + 3n + BigInt(mode)));
     });
   }
 
   it('mode A reserves nothing extra once settled; mode B escrows one period', () => {
     // Mode A created at T with lastPeriodTime = T − period: n = 1, modeB = 0.
-    expect(base({ mode: MODE_A }).settlement().reserved).toBe(10n);
+    expect(base({ mode: MODE_A }).settlement().owedPreSettle).toBe(10n);
     // Mode B created at T: n = 0, modeB = 1.
-    expect(base({ mode: MODE_B }).settlement().reserved).toBe(10n);
+    expect(base({ mode: MODE_B }).settlement().owedPreSettle).toBe(10n);
+  });
+
+  it('the service fee does not change owedPreSettle', () => {
+    // owedPreSettle is computed without the fee (the fee is a split inside the payout).
+    const sub = base({ mode: MODE_B, escrow: 1_000n });
+    sub.advance(3 * DAY);
+    const s = sub.settlement();
+    expect(s.owedPreSettle).toBe(10n * 4n);
+    expect(s.fee).toBeGreaterThan(0n);
   });
 });
 
-describe('n-period catch-up', () => {
+describe('m-period catch-up', () => {
   it('on-time pull pays exactly one period', async () => {
     const sub = base({ mode: MODE_B });
     sub.advance(DAY);
@@ -177,7 +189,7 @@ describe('n-period catch-up', () => {
   });
 
   it('late pull settles all elapsed periods it can cover', async () => {
-    const sub = base({ mode: MODE_B, balance: 100n });
+    const sub = base({ mode: MODE_B, escrow: 100n });
     sub.advance(3 * DAY);
     await sub.pull().send();
     const after = await sub.readCovenant();
@@ -196,28 +208,29 @@ describe('n-period catch-up', () => {
   });
 
   it('partial settle when underfunded, then pause', async () => {
-    const sub = base({ mode: MODE_B, balance: 10n });
+    const sub = base({ mode: MODE_B, escrow: 11n }); // 10 spendable + 1 seed
     sub.advance(3 * DAY);
     await sub.pull().send();
     const after = await sub.readCovenant();
     expect(after.state?.lastPeriodTime).toBe(T + DAY); // advanced by m = 1 only
-    // The balance was fully paid out, so no funds UTXO remains.
-    expect(after.funds).toBeUndefined();
+    // The spendable was fully paid out, so only the seed remains.
+    expect(after.funds).toBe(SEED);
   });
 
   it('full catch-up after arrears reactivates the subscription', async () => {
-    const sub = base({ mode: MODE_B, balance: 10n });
+    const sub = base({ mode: MODE_B, escrow: 11n });
     sub.advance(3 * DAY);
     await sub.send(sub.pull()); // pays 1, leaves 2 in arrears
-    sub.setBalance(20n); // fund the remaining 2 periods
+    sub.setEscrow(21n); // fund the remaining 2 periods (+seed)
     await sub.send(sub.pull());
     const after = await sub.readCovenant();
     expect(after.state?.lastPeriodTime).toBe(T + 3 * DAY);
-    expect(after.funds).toBeUndefined();
+    expect(after.funds).toBe(SEED);
   });
 
   it('no cascade after a long gap: one settlement, next boundary one period away', async () => {
-    const sub = base({ mode: MODE_B, balance: 100n });
+    // Escrow 101 → spendable 100 → m = 10 of 10 elapsed.
+    const sub = base({ mode: MODE_B, escrow: 101n });
     sub.advance(10 * DAY);
     await sub.pull().send();
     const after = await sub.readCovenant();

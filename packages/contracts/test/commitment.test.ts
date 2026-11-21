@@ -24,7 +24,7 @@ const base = (over: Partial<Parameters<typeof scenario>[0]> = {}) =>
     mode: MODE_A,
     amount: 10n,
     period: DAY,
-    balance: 100n,
+    escrow: 100n,
     creationTime: T,
     ...over,
   });
@@ -66,7 +66,7 @@ describe('creation (mode A and B)', () => {
     const s = sub.settlement();
     expect(s.n).toBe(1n);
     expect(s.payable).toBe(10n);
-    expect(s.reserved).toBe(10n);
+    expect(s.owedPreSettle).toBe(10n);
   });
 
   it('mode B anchors lastPeriodTime at creation, so the first pull waits one period', () => {
@@ -75,7 +75,7 @@ describe('creation (mode A and B)', () => {
     const s = sub.settlement();
     expect(s.n).toBe(0n);
     expect(s.payable).toBe(0n);
-    expect(s.reserved).toBe(10n); // mode B escrows the current period
+    expect(s.owedPreSettle).toBe(10n); // mode B escrows the current period
   });
 
   it('mode A pull is rejected exactly one second before the anchor allows it', async () => {

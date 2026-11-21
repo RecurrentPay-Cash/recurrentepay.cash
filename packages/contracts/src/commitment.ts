@@ -5,13 +5,15 @@
  * `readState`/`writeState`). Anything the contract enforces on-chain is derived
  * here the same way, so txserver/web/dapp can compute the transition layout
  * blind — the output layout of every covenant spend is a pure function of
- * (state, balance, clock).
+ * (state, escrow, clock).
  *
  * Byte order: every numeric field is stored little-endian (`OP_NUM2BIN`, the
  * script-number encoding), zero-padded to its fixed width. Token categories and
  * key hashes are raw byte sequences in *internal* order — the order CashScript's
  * `tokenCategory` introspection reports, NOT the byte order explorers print.
  */
+import { SEED, perPeriodFee } from './constants.js';
+
 
 /** Number of bytes each commitment field occupies. */
 export const PKH_SIZE = 20;
@@ -141,15 +143,19 @@ export function promoted(state: SubscriptionState): SubscriptionState {
 }
 
 // ---------------------------------------------------------------------------
-// Settlement arithmetic (design.md § Settlement semantics — n-period catch-up)
+// Settlement arithmetic (design.md § Settlement semantics — m-period catch-up)
 // ---------------------------------------------------------------------------
 
 export interface Settlement {
   /** Elapsed periods at `now` (`n`). */
   n: bigint;
-  /** Periods the balance covers (`m`). */
+  /** Periods the escrow covers (`m`). */
   m: bigint;
-  /** Paid to the supportee this settle (`m · amount`). */
+  /** Gross paid to the supportee this settle (`m · amount`). */
+  gross: bigint;
+  /** Service fee carved out of `gross` (`m · perPeriodFee(amount)`). */
+  fee: bigint;
+  /** Net paid to the supportee (`gross − fee`). */
   paid: bigint;
   /** `lastPeriodTime` after the settle (`+= m · period`, old period). */
   newLastPeriodTime: number;
@@ -157,33 +163,52 @@ export interface Settlement {
   newAmount: bigint;
   /** `period` after the settle (always-replace). */
   newPeriod: number;
-  /** Funds balance after the settle. */
+  /** Escrow balance after the settle (`escrow − gross`). */
   remaining: bigint;
   /** `payable = amount · n` — earned by the supportee at this moment. */
   payable: bigint;
-  /** `reserved = amount · (n + modeB)` — must remain in the covenant. */
-  reserved: bigint;
+  /**
+   * `owedPreSettle = amount · (n + modeB)` — the supportee's PRE-settle
+   * entitlement; the covenant must retain `owedPreSettle − gross` after the
+   * settle. (Not `migrate`'s post-settle `carryOver`, which is a different
+   * quantity that happens to collapse to the same retained balance.)
+   */
+  owedPreSettle: bigint;
 }
 
-export function settle(state: SubscriptionState, balance: bigint, now: number): Settlement {
+/**
+ * Mirror of the contract's shared `settle()` core. `spendable = escrow − SEED` is
+ * the settlement balance (the escrow only — never `totalIn`).
+ */
+export function settle(state: SubscriptionState, spendable: bigint, now: number): Settlement {
   if (now < state.lastPeriodTime) {
     throw new Error('settle: locktime is before the anchor');
   }
   const n = BigInt(Math.floor((now - state.lastPeriodTime) / state.period));
-  const m = n < balance / state.amount ? n : balance / state.amount;
-  const paid = m * state.amount;
+  const m = n < spendable / state.amount ? n : spendable / state.amount;
+  const gross = m * state.amount;
+  const fee = m * perPeriodFee(state.amount);
+  const paid = gross - fee;
   const newLastPeriodTime = state.lastPeriodTime + Number(m) * state.period;
   const payable = n * state.amount;
-  const reserved = n * state.amount + BigInt(state.mode) * state.amount;
+  const owedPreSettle = n * state.amount + BigInt(state.mode) * state.amount;
   return {
     n,
     m,
+    gross,
+    fee,
     paid,
     newLastPeriodTime,
     newAmount: state.amountNext,
     newPeriod: state.periodNext,
-    remaining: balance - paid,
+    remaining: spendable - gross,
     payable,
-    reserved,
+    owedPreSettle,
   };
 }
+
+/** The escrow amount implied by a `spendable` balance: `escrow = spendable + SEED`. */
+export function escrowFromSpendable(spendable: bigint): bigint {
+  return spendable + SEED;
+}
+
