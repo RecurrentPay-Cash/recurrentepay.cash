@@ -226,12 +226,25 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
   `0 supportee, 1 service, 2 state, 3 funds` + BCH change tail), `nLockTime = now`, service-address
   presence input, per-boundary idempotency (serialized per subscription + `pull` row written before
   broadcast); broadcast via the CashScript `NetworkProvider.sendRawTransaction` (the same provider
-  the builder validates with — `ChainWatcher.broadcast` was removed as dead code). BCH/oracle pull
-  builder is Slice 3c.
+  the builder validates with — `ChainWatcher.broadcast` was removed as dead code).
+  — **Slice 3c (oracle/BCH subs):** `OraclePullExecutorService.buildOraclePull`/`executeOraclePull`
+  (single-UTXO covenant: `balance = state output value`, `spendable = balance − DUST`; output layout
+  `0 supportee, 1 service` only when `gross > 0`, then `2 state` with value `balance − gross`;
+  `nLockTime = now`; service presence input; per-boundary idempotency). Price comes from a freshly
+  fetched signed message (`OracleClientService.fetchFresh`); a non-fresh message throws
+  `OraclePullDeferredError` and broadcasts nothing (caller skips + marks `degraded`). The pubkey is
+  resolved from `subscription.oracle_pubkey` (populated at discovery/link time); absent → fails loudly.
+  `covenantAddress()` is now artifact-aware (`assetType === 'oracle' ? oracleArtifact : tokenArtifact`),
+  fixing the wrong-address bug for oracle subs across derived-state/pull/cancel/discovery.
+  Tests: `oracle-pull.test.ts` (layout + locktime, m=1/m=3 VM-accepted, stale→deferred+no broadcast,
+  pubkey-unresolvable, not-due, idempotency, derived-state parity, artifact-aware address).
 - [x] 8.6 Scheduler: due scan loop, buffer-warning trigger
   — **Slice 3a:** `SchedulerService.scanDue`/`runOnce` (refresh → pull the `due` ones), buffer
   warning (`escrow < bufferPercent × amount`), in-process concurrent-scan guard, interval loop
   guarded by config (off in tests); `DiscoveryService` wired to `watcher.onChange` (Taiga #24)
+  — **Slice 3c:** `runScan` threads `assetType` into `WatchedSubscription` and routes oracle subs to
+  `OraclePullExecutorService`; a non-fresh oracle message marks the sub `degraded` and retries next
+  cycle (never broadcasts a stale/partial tx). Token path unchanged.
 - [x] 8.7 REST API: subscriptions by party, detail (incl. arrears `n'`), notifications, auto-cancel
   policy config — **authenticated** (party pkh proof), reads scoped to the caller
   — **Slice 4:** `POST /auth/challenge` + `POST /auth/session` (Schnorr over
