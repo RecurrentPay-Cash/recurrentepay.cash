@@ -6,10 +6,12 @@ import { Account } from '../db/account.entity.js';
 import { Channel } from '../db/channel.entity.js';
 import { Plan } from '../db/plan.entity.js';
 import { SubscriptionLink } from '../db/subscription-link.entity.js';
+import { ChannelAutoCancelPolicy } from '../db/channel-auto-cancel-policy.entity.js';
 import { AccountRepository } from './account.repository.js';
 import { ChannelRepository } from './channel.repository.js';
 import { PlanRepository } from './plan.repository.js';
 import { SubscriptionLinkRepository } from './subscription-link.repository.js';
+import { ChannelAutoCancelPolicyRepository } from './channel-policy.repository.js';
 import { OffchainService } from './offchain.service.js';
 import { OffchainController } from './offchain.controller.js';
 import { DemoSeedService } from './demo-seed.service.js';
@@ -26,7 +28,7 @@ import { DemoSeedService } from './demo-seed.service.js';
  */
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Account, Channel, Plan, SubscriptionLink]),
+    TypeOrmModule.forFeature([Account, Channel, Plan, SubscriptionLink, ChannelAutoCancelPolicy]),
     AuthModule,
     SubscriptionModule,
   ],
@@ -36,6 +38,7 @@ import { DemoSeedService } from './demo-seed.service.js';
     ChannelRepository,
     PlanRepository,
     SubscriptionLinkRepository,
+    ChannelAutoCancelPolicyRepository,
     OffchainService,
     DemoSeedService,
   ],

@@ -11,6 +11,9 @@ import { CreateNotificationWebhook1700000000003 } from '../src/db/migrations/170
 import { CreateScheduledCancel1700000000004 } from '../src/db/migrations/1700000000004-create-scheduled-cancel.js';
 import { AddPolicyWarnedAt1700000000005 } from '../src/db/migrations/1700000000005-add-policy-warned-at.js';
 import { CreateOffchain1700000000006 } from '../src/db/migrations/1700000000006-create-offchain.js';
+import { AddPlanUnit1700000000008 } from '../src/db/migrations/1700000000008-add-plan-unit.js';
+import { CreateChannelAutoCancelPolicy1700000000010 } from '../src/db/migrations/1700000000010-create-channel-auto-cancel-policy.js';
+import { AddNotificationReadAt1700000000009 } from '../src/db/migrations/1700000000009-add-notification-read-at.js';
 
 describe('migration 1700000000003 (notification/webhook/auto_cancel_policy)', () => {
   let dataSource: DataSource;
@@ -209,6 +212,138 @@ describe('migration 1700000000006 (off-chain: account / channel / plan / subscri
 
 /** Run migration 1700000000006's `up` against a recorder. */
 async function captureUp6(migration: CreateOffchain1700000000006): Promise<string[]> {
+  const recorded: string[] = [];
+  const recorder = {
+    query: async (sql: string) => {
+      recorded.push(sql);
+      return [];
+    },
+  } as unknown as QueryRunner;
+  await migration.up(recorder);
+  return recorded;
+}
+
+describe('migration 1700000000008 (plan.unit)', () => {
+  let dataSource: DataSource;
+  let queryRunner: QueryRunner;
+
+  beforeAll(async () => {
+    dataSource = new DataSource({ type: 'better-sqlite3', database: ':memory:' });
+    await dataSource.initialize();
+    queryRunner = dataSource.createQueryRunner();
+    // The column is added to a table created by migration 1700000000006.
+    for (const statement of statementsFor(await captureUp6(new CreateOffchain1700000000006()))) {
+      await queryRunner.query(statement);
+    }
+  });
+
+  afterAll(async () => {
+    await dataSource.destroy();
+  });
+
+  it('adds and drops the nullable plan.unit column', async () => {
+    const migration = new AddPlanUnit1700000000008();
+    await expect(migration.up(queryRunner)).resolves.toBeUndefined();
+    const cols = (await queryRunner.query(`PRAGMA table_info("plan")`)) as Array<{ name: string }>;
+    expect(cols.map((c) => c.name)).toContain('unit');
+
+    await expect(migration.down(queryRunner)).resolves.toBeUndefined();
+    const after = (await queryRunner.query(`PRAGMA table_info("plan")`)) as Array<{ name: string }>;
+    expect(after.map((c) => c.name)).not.toContain('unit');
+  });
+});
+
+describe('migration 1700000000010 (channel_auto_cancel_policy)', () => {
+  let dataSource: DataSource;
+  let queryRunner: QueryRunner;
+
+  beforeAll(async () => {
+    dataSource = new DataSource({ type: 'better-sqlite3', database: ':memory:' });
+    await dataSource.initialize();
+    queryRunner = dataSource.createQueryRunner();
+  });
+
+  afterAll(async () => {
+    await dataSource.destroy();
+  });
+
+  it('round-trips up then down without throwing', async () => {
+    const migration = new CreateChannelAutoCancelPolicy1700000000010();
+
+    for (const statement of statementsFor(await captureUp10(migration))) {
+      await queryRunner.query(statement);
+    }
+    const upTables = await tables(queryRunner);
+    expect(upTables).toContain('channel_auto_cancel_policy');
+
+    const cols = (await queryRunner.query(
+      `PRAGMA table_info("channel_auto_cancel_policy")`,
+    )) as Array<{ name: string }>;
+    expect(cols.map((c) => c.name)).toEqual(
+      expect.arrayContaining([
+        'channel_id',
+        'threshold_periods',
+        'grace_seconds',
+        'enabled',
+      ]),
+    );
+
+    await expect(migration.down(queryRunner)).resolves.toBeUndefined();
+    const downTables = await tables(queryRunner);
+    expect(downTables).not.toContain('channel_auto_cancel_policy');
+  });
+});
+
+/** Run migration 1700000000010's `up` against a recorder. */
+async function captureUp10(
+  migration: CreateChannelAutoCancelPolicy1700000000010,
+): Promise<string[]> {
+  const recorded: string[] = [];
+  const recorder = {
+    query: async (sql: string) => {
+      recorded.push(sql);
+      return [];
+    },
+  } as unknown as QueryRunner;
+  await migration.up(recorder);
+  return recorded;
+}
+
+describe('migration 1700000000009 (notification_read)', () => {
+  let dataSource: DataSource;
+  let queryRunner: QueryRunner;
+
+  beforeAll(async () => {
+    dataSource = new DataSource({ type: 'better-sqlite3', database: ':memory:' });
+    await dataSource.initialize();
+    queryRunner = dataSource.createQueryRunner();
+    // The join table references `notification`, created by migration 1700000000003.
+    for (const statement of statementsFor(await captureUp3())) {
+      await queryRunner.query(statement);
+    }
+  });
+
+  afterAll(async () => {
+    await dataSource.destroy();
+  });
+
+  it('round-trips up then down without throwing', async () => {
+    const migration = new AddNotificationReadAt1700000000009();
+
+    for (const statement of statementsFor(await captureUp9(migration))) {
+      await queryRunner.query(statement);
+    }
+    const upTables = await tables(queryRunner);
+    expect(upTables).toEqual(expect.arrayContaining(['notification_read']));
+
+    await expect(migration.down(queryRunner)).resolves.toBeUndefined();
+    const downTables = await tables(queryRunner);
+    expect(downTables).not.toEqual(expect.arrayContaining(['notification_read']));
+  });
+});
+
+/** Run migration 1700000000009's `up` against a recorder. */
+async function captureUp9(migration: AddNotificationReadAt1700000000009): Promise<string[]> {
   const recorded: string[] = [];
   const recorder = {
     query: async (sql: string) => {

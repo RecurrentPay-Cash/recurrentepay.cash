@@ -11,6 +11,7 @@
 import { Global, Module, type OnModuleInit } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { Notification } from '../db/notification.entity.js';
+import { NotificationRead } from '../db/notification-read.entity.js';
 import { WebhookEndpoint } from '../db/webhook-endpoint.entity.js';
 import { SubscriptionModule } from '../subscription/subscription.module.js';
 import { SchedulerModule } from '../scheduler/scheduler.module.js';
@@ -20,6 +21,7 @@ import { CancelExecutorService } from '../cancel/cancel-executor.service.js';
 import { AutoCancelService } from '../cancel/auto-cancel.service.js';
 import { SubscriptionRepository } from '../subscription/subscription.repository.js';
 import { NotificationRepository } from './notification.repository.js';
+import { NotificationReadRepository } from './notification-read.repository.js';
 import { WebhookEndpointRepository } from './webhook-endpoint.repository.js';
 import {
   NotificationService,
@@ -33,18 +35,24 @@ const fetchClient: WebhookHttpClient = (url, init) => fetch(url, init);
 @Global()
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Notification, WebhookEndpoint]),
+    TypeOrmModule.forFeature([Notification, NotificationRead, WebhookEndpoint]),
     SubscriptionModule,
     SchedulerModule,
     CancelModule,
   ],
   providers: [
     NotificationRepository,
+    NotificationReadRepository,
     WebhookEndpointRepository,
     { provide: WEBHOOK_HTTP_CLIENT, useValue: fetchClient },
     NotificationService,
   ],
-  exports: [NotificationRepository, WebhookEndpointRepository, NotificationService],
+  exports: [
+    NotificationRepository,
+    NotificationReadRepository,
+    WebhookEndpointRepository,
+    NotificationService,
+  ],
 })
 export class NotificationsModule implements OnModuleInit {
   constructor(

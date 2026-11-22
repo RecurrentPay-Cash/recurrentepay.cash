@@ -7,6 +7,9 @@ import { CreateScheduledCancel1700000000004 } from './migrations/1700000000004-c
 import { AddPolicyWarnedAt1700000000005 } from './migrations/1700000000005-add-policy-warned-at.js';
 import { CreateOffchain1700000000006 } from './migrations/1700000000006-create-offchain.js';
 import { CreateMutualConsentProposal1700000000007 } from './migrations/1700000000007-create-mutual-consent-proposal.js';
+import { AddPlanUnit1700000000008 } from './migrations/1700000000008-add-plan-unit.js';
+import { AddNotificationReadAt1700000000009 } from './migrations/1700000000009-add-notification-read-at.js';
+import { CreateChannelAutoCancelPolicy1700000000010 } from './migrations/1700000000010-create-channel-auto-cancel-policy.js';
 import { loadConfig } from '../config.js';
 
 /**
@@ -26,6 +29,9 @@ async function main(): Promise<void> {
       AddPolicyWarnedAt1700000000005,
       CreateOffchain1700000000006,
       CreateMutualConsentProposal1700000000007,
+      AddPlanUnit1700000000008,
+      AddNotificationReadAt1700000000009,
+      CreateChannelAutoCancelPolicy1700000000010,
     ],
   });
   await dataSource.initialize();

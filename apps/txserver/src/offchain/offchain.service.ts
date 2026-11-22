@@ -12,6 +12,11 @@ import { AccountRepository } from './account.repository.js';
 import { ChannelRepository, type ChannelUpsert } from './channel.repository.js';
 import { PlanRepository, type PlanUpsert } from './plan.repository.js';
 import { SubscriptionLinkRepository } from './subscription-link.repository.js';
+import {
+  ChannelAutoCancelPolicyRepository,
+  DEFAULT_CHANNEL_POLICY,
+  type ChannelPolicyView,
+} from './channel-policy.repository.js';
 
 /** A creator's channel + its plans, as the API exposes them. */
 export interface ChannelView {
@@ -34,10 +39,22 @@ export interface PlanView {
   amount: string;
   period: number;
   asset: string;
+  unit: string | null;
   benefits: string[] | null;
   defaultMode: number;
   visible: boolean;
 }
+
+/** A channel as the public picker exposes it (no owner/plan detail). */
+export interface PublicChannelSummary {
+  id: number;
+  title: string;
+  cover: string | null;
+  description: string | null;
+}
+
+/** The allowed display denominations for a plan's `unit` (dapp-handoff §7). */
+export const PLAN_UNITS = ['BCH', 'PUSD', 'MUSD', 'USD', 'XAU'] as const;
 
 /**
  * Off-chain platform service (spec § Off-chain channel and plan management).
@@ -58,6 +75,7 @@ export class OffchainService {
     private readonly channels: ChannelRepository,
     private readonly plans: PlanRepository,
     private readonly links: SubscriptionLinkRepository,
+    private readonly channelPolicies: ChannelAutoCancelPolicyRepository,
   ) {}
 
   /**
@@ -113,6 +131,47 @@ export class OffchainService {
     return this.toChannelView(updated);
   }
 
+  /**
+   * The caller's effective channel auto-cancel policy (dapp-handoff §14): the
+   * stored channel default, or the disabled defaults when unset. Owner-scoped —
+   * a caller with no channel is a 403.
+   */
+  async channelAutoCancelPolicy(pkh: string): Promise<ChannelPolicyView> {
+    const channel = await this.requireOwnChannel(pkh);
+    const row = await this.channelPolicies.find(channel.id);
+    if (row === null) return { ...DEFAULT_CHANNEL_POLICY };
+    return {
+      thresholdPeriods: row.thresholdPeriods,
+      graceSeconds: row.graceSeconds,
+      enabled: row.enabled,
+    };
+  }
+
+  /**
+   * Set the caller's channel-level default auto-cancel policy (dapp-handoff §14).
+   * Validates the values (positive threshold, non-negative grace) and upserts the
+   * one row for the channel. Owner-scoped.
+   */
+  async setChannelAutoCancelPolicy(
+    pkh: string,
+    body: { thresholdPeriods?: unknown; graceSeconds?: unknown; enabled?: unknown },
+  ): Promise<ChannelPolicyView> {
+    const channel = await this.requireOwnChannel(pkh);
+    const thresholdPeriods = requirePositiveInt(body?.thresholdPeriods, 'thresholdPeriods');
+    const graceSeconds = requireNonNegativeInt(body?.graceSeconds, 'graceSeconds');
+    const row = await this.channelPolicies.upsert({
+      channelId: channel.id,
+      thresholdPeriods,
+      graceSeconds,
+      enabled: body?.enabled === undefined ? true : Boolean(body.enabled),
+    });
+    return {
+      thresholdPeriods: row.thresholdPeriods,
+      graceSeconds: row.graceSeconds,
+      enabled: row.enabled,
+    };
+  }
+
   /** Add a plan to the caller's channel. */
   async createPlan(pkh: string, body: Partial<PlanUpsert>): Promise<PlanView> {
     const channel = await this.requireOwnChannel(pkh);
@@ -123,6 +182,7 @@ export class OffchainService {
       amount: requireAmount(body.amount),
       period: requirePeriod(body.period),
       asset: body.asset ?? 'BCH',
+      unit: requireUnit(body.unit),
       benefits: body.benefits ?? null,
       defaultMode: normalizeMode(body.defaultMode ?? channel.defaultMode),
     });
@@ -138,6 +198,7 @@ export class OffchainService {
     if (body.amount !== undefined) patch.amount = requireAmount(body.amount);
     if (body.period !== undefined) patch.period = requirePeriod(body.period);
     if (body.asset !== undefined) patch.asset = body.asset;
+    if (body.unit !== undefined) patch.unit = requireUnit(body.unit);
     if (body.benefits !== undefined) patch.benefits = body.benefits;
     if (body.defaultMode !== undefined) patch.defaultMode = normalizeMode(body.defaultMode);
     const updated = await this.plans.update(plan.id, patch);
@@ -169,6 +230,30 @@ export class OffchainService {
         ? await this.plans.findAllVisible()
         : await this.plans.findVisibleByChannel(channelId);
     return rows.map(toPlanView);
+  }
+
+  /**
+   * Public channel read by id (dapp-handoff §4): the channel plus its **visible**
+   * plans. Unknown or hidden channel → `404`. No auth: it exposes only discovery
+   * metadata (never a party's subscriptions), so it is safe to serve publicly.
+   */
+  async publicChannel(channelId: number): Promise<ChannelView> {
+    const channel = await this.channels.findById(channelId);
+    if (channel === null) throw new NotFoundException('channel not found');
+    return this.toChannelView(channel);
+  }
+
+  /** Public channel list for the picker (dapp-handoff §4): id/title/cover/description. */
+  async publicChannels(): Promise<PublicChannelSummary[]> {
+    const rows = await this.channels.findAll();
+    return rows
+      .map((channel) => ({
+        id: channel.id,
+        title: channel.title,
+        cover: channel.cover,
+        description: channel.description,
+      }))
+      .sort((a, b) => a.id - b.id);
   }
 
   /** Resolve a plan for the wizard, regardless of visibility (hidden resolves). */
@@ -257,6 +342,42 @@ export class OffchainService {
     return this.links.findSubscriptionIdsByScope(scope);
   }
 
+  /**
+   * Plan/channel context for a batch of subscriptions (dapp-handoff §12).
+   *
+   * The dashboard/detail show the plan title + benefits, which live on the
+   * `plan` row joined via `subscription_link`. Batched to avoid an N+1 read on
+   * the list route. Only **existing** links are returned; a sub with no link
+   * (a scratch sub) is simply absent from the map.
+   */
+  async linkContextFor(
+    subscriptionIds: string[],
+  ): Promise<Map<string, { channelId: number; planId: number | null; planTitle?: string; benefits?: string[] }>> {
+    const context = new Map<
+      string,
+      { channelId: number; planId: number | null; planTitle?: string; benefits?: string[] }
+    >();
+    if (subscriptionIds.length === 0) return context;
+    const links = await this.links.findBySubscriptions(subscriptionIds);
+    for (const link of links) {
+      const entry: {
+        channelId: number;
+        planId: number | null;
+        planTitle?: string;
+        benefits?: string[];
+      } = { channelId: link.channelId, planId: link.planId };
+      if (link.planId !== null) {
+        const plan = await this.plans.findById(link.planId);
+        if (plan !== null) {
+          entry.planTitle = plan.title;
+          if (plan.benefits !== null) entry.benefits = plan.benefits;
+        }
+      }
+      context.set(link.subscriptionId, entry);
+    }
+    return context;
+  }
+
   private async requireOwnChannel(pkh: string): Promise<Channel> {
     const account = await this.accountFor(pkh);
     const channel = await this.channels.findByOwner(account.id);
@@ -300,6 +421,7 @@ export function toPlanView(plan: Plan): PlanView {
     amount: plan.amount,
     period: plan.period,
     asset: plan.asset,
+    unit: plan.unit,
     benefits: plan.benefits,
     defaultMode: plan.defaultMode,
     visible: plan.visible,
@@ -340,4 +462,34 @@ function requirePeriod(value: unknown): number {
     throw new BadRequestException('period must be a positive integer');
   }
   return period;
+}
+
+/** A positive integer (channel auto-cancel `thresholdPeriods`). */
+function requirePositiveInt(value: unknown, field: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new BadRequestException(`${field} must be a positive integer`);
+  }
+  return parsed;
+}
+
+/** A non-negative integer (channel auto-cancel `graceSeconds`). */
+function requireNonNegativeInt(value: unknown, field: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new BadRequestException(`${field} must be a non-negative integer`);
+  }
+  return parsed;
+}
+
+/**
+ * Validate a plan's display `unit` against the allowed set (dapp-handoff §7).
+ * `undefined`/`null`/`''` → `null` (unset); an unknown unit is a 400.
+ */
+function requireUnit(value: unknown): string | null {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value !== 'string' || !(PLAN_UNITS as readonly string[]).includes(value)) {
+    throw new BadRequestException(`unit must be one of ${PLAN_UNITS.join(', ')}`);
+  }
+  return value;
 }

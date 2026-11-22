@@ -21,6 +21,7 @@ import { PullRepository } from './pull.repository.js';
 import { PullExecutorService, type PullExecutorConfig } from './pull-executor.service.js';
 import { OraclePullExecutorService } from './oracle-pull-executor.service.js';
 import { OracleActionsService } from './oracle-actions.service.js';
+import { TokenActionsService } from './token-actions.service.js';
 
 export const PULL_NETWORK_PROVIDER = 'PULL_NETWORK_PROVIDER';
 export const PULL_EXECUTOR_CONFIG = 'PULL_EXECUTOR_CONFIG';
@@ -58,7 +59,14 @@ export const PULL_EXECUTOR_CONFIG = 'PULL_EXECUTOR_CONFIG';
     PullExecutorService,
     OraclePullExecutorService,
     OracleActionsService,
+    TokenActionsService,
   ],
-  exports: [PullRepository, PullExecutorService, OraclePullExecutorService, OracleActionsService],
+  exports: [
+    PullRepository,
+    PullExecutorService,
+    OraclePullExecutorService,
+    OracleActionsService,
+    TokenActionsService,
+  ],
 })
 export class PullModule {}

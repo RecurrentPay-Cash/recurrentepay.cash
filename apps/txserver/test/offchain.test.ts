@@ -30,6 +30,10 @@ import { AccountRepository } from '../src/offchain/account.repository.js';
 import { ChannelRepository } from '../src/offchain/channel.repository.js';
 import { PlanRepository } from '../src/offchain/plan.repository.js';
 import { SubscriptionLinkRepository } from '../src/offchain/subscription-link.repository.js';
+import { ChannelAutoCancelPolicyRepository } from '../src/offchain/channel-policy.repository.js';
+import { ChannelAutoCancelPolicy } from '../src/db/channel-auto-cancel-policy.entity.js';
+import { NotificationRead } from '../src/db/notification-read.entity.js';
+import { NotificationReadRepository } from '../src/notifications/notification-read.repository.js';
 import { OffchainService } from '../src/offchain/offchain.service.js';
 import { OffchainController } from '../src/offchain/offchain.controller.js';
 import { ChallengeService } from '../src/auth/challenge.service.js';
@@ -39,6 +43,9 @@ import { AuthController } from '../src/api/auth.controller.js';
 import { SubscriptionsController } from '../src/api/subscriptions.controller.js';
 import { DiscoveryService } from '../src/discovery/discovery.service.js';
 import { OracleActionsService } from '../src/pull/oracle-actions.service.js';
+import { TokenActionsService } from '../src/pull/token-actions.service.js';
+import { PullRepository } from '../src/pull/pull.repository.js';
+import { Pull } from '../src/db/pull.entity.js';
 import { NotificationsController } from '../src/api/notifications.controller.js';
 import { WebhooksController } from '../src/api/webhooks.controller.js';
 import { AutoCancelPolicyRepository } from '../src/api/auto-cancel-policy.repository.js';
@@ -126,6 +133,9 @@ describe('Off-chain channel/plan CRUD', () => {
         WebhookEndpoint,
         Cancel,
         ScheduledCancel,
+        ChannelAutoCancelPolicy,
+        NotificationRead,
+        Pull,
       ],
       synchronize: true,
     });
@@ -135,13 +145,19 @@ describe('Off-chain channel/plan CRUD', () => {
     const channels = new ChannelRepository(dataSource.getRepository(Channel));
     const plans = new PlanRepository(dataSource.getRepository(Plan));
     const links = new SubscriptionLinkRepository(dataSource.getRepository(SubscriptionLink));
-    const offchain = new OffchainService(accounts, channels, plans, links);
+    const channelPolicies = new ChannelAutoCancelPolicyRepository(
+      dataSource.getRepository(ChannelAutoCancelPolicy),
+    );
+    const offchain = new OffchainService(accounts, channels, plans, links, channelPolicies);
 
     const challenges = new ChallengeService();
     const sessions = new SessionService(challenges);
     const guard = new AuthGuard(sessions);
     const policies = new AutoCancelPolicyRepository(dataSource.getRepository(AutoCancelPolicy));
     const notifications = new NotificationRepository(dataSource.getRepository(Notification));
+    const notificationReads = new NotificationReadRepository(
+      dataSource.getRepository(NotificationRead),
+    );
     const webhooks = new WebhookEndpointRepository(dataSource.getRepository(WebhookEndpoint));
     const cancels = new CancelRepository(dataSource.getRepository(Cancel));
     const cancelExecutor = new CancelExecutorService({} as never, cancels, repository, {});
@@ -167,6 +183,7 @@ describe('Off-chain channel/plan CRUD', () => {
         { provide: SubscriptionLinkRepository, useValue: links },
         { provide: AutoCancelPolicyRepository, useValue: policies },
         { provide: NotificationRepository, useValue: notifications },
+        { provide: NotificationReadRepository, useValue: notificationReads },
         { provide: WebhookEndpointRepository, useValue: webhooks },
         { provide: ScheduledCancelService, useValue: scheduledCancels },
         { provide: ChallengeService, useValue: challenges },
@@ -174,6 +191,8 @@ describe('Off-chain channel/plan CRUD', () => {
         { provide: AuthGuard, useValue: guard },
         { provide: DiscoveryService, useValue: { discover: async () => ({ tracked: false, reason: "test" }) } },
         { provide: OracleActionsService, useValue: {} },
+        { provide: TokenActionsService, useValue: {} },
+        { provide: PullRepository, useValue: new PullRepository(dataSource.getRepository(Pull)) },
       ],
     }).compile();
 
@@ -197,6 +216,9 @@ describe('Off-chain channel/plan CRUD', () => {
       Notification,
       WebhookEndpoint,
       ScheduledCancel,
+      ChannelAutoCancelPolicy,
+      NotificationRead,
+      Pull,
     ]) {
       await dataSource.getRepository(entity).clear();
     }
@@ -469,5 +491,78 @@ describe('Off-chain channel/plan CRUD', () => {
       .set('Authorization', `Bearer ${aToken}`)
       .send({ title: 'Bad', amount: '0', period: DAY })
       .expect(400);
+  });
+
+  it('round-trips a plan unit and rejects an unknown one', async () => {
+    await request(app.getHttpServer())
+      .post('/offchain/channel')
+      .set('Authorization', `Bearer ${aToken}`)
+      .send({ title: 'Alice Channel' })
+      .expect(201);
+
+    const plan = await request(app.getHttpServer())
+      .post('/offchain/plans')
+      .set('Authorization', `Bearer ${aToken}`)
+      .send({ title: 'USD plan', amount: '10000', period: DAY, unit: 'USD' })
+      .expect(201);
+    expect(plan.body.unit).toBe('USD');
+
+    // The unit is threaded through the plan data API read too.
+    const data = await request(app.getHttpServer()).get('/offchain/plan-data').expect(200);
+    expect(data.body.find((p: { id: number }) => p.id === plan.body.id).unit).toBe('USD');
+
+    // An unknown unit is rejected.
+    await request(app.getHttpServer())
+      .post('/offchain/plans')
+      .set('Authorization', `Bearer ${aToken}`)
+      .send({ title: 'Bad unit', amount: '10000', period: DAY, unit: 'EUR' })
+      .expect(400);
+  });
+
+  it('serves a public channel read with visible plans only, 404 for unknown', async () => {
+    const created = await request(app.getHttpServer())
+      .post('/offchain/channel')
+      .set('Authorization', `Bearer ${aToken}`)
+      .send({ title: 'Alice Channel', description: 'hi' })
+      .expect(201);
+    const visible = await request(app.getHttpServer())
+      .post('/offchain/plans')
+      .set('Authorization', `Bearer ${aToken}`)
+      .send({ title: 'Visible', amount: '10000', period: DAY, unit: 'USD' })
+      .expect(201);
+    const hidden = await request(app.getHttpServer())
+      .post('/offchain/plans')
+      .set('Authorization', `Bearer ${aToken}`)
+      .send({ title: 'Hidden', amount: '10000', period: DAY })
+      .expect(201);
+    await request(app.getHttpServer())
+      .delete(`/offchain/plans/${hidden.body.id}`)
+      .set('Authorization', `Bearer ${aToken}`)
+      .expect(200);
+
+    // Public (no auth): the channel + its visible plans only.
+    const res = await request(app.getHttpServer())
+      .get(`/offchain/channels/${created.body.id}`)
+      .expect(200);
+    expect(res.body).toMatchObject({ id: created.body.id, title: 'Alice Channel' });
+    const planIds = res.body.plans.map((p: { id: number }) => p.id);
+    expect(planIds).toEqual([visible.body.id]);
+    expect(res.body.plans[0].unit).toBe('USD');
+
+    // Unknown channel → 404.
+    await request(app.getHttpServer()).get('/offchain/channels/999999').expect(404);
+  });
+
+  it('lists public channels for the picker (no auth)', async () => {
+    const first = await request(app.getHttpServer())
+      .post('/offchain/channel')
+      .set('Authorization', `Bearer ${aToken}`)
+      .send({ title: 'Alice Channel', description: 'hi' })
+      .expect(201);
+
+    const list = await request(app.getHttpServer()).get('/offchain/channels').expect(200);
+    expect(list.body).toEqual([
+      { id: first.body.id, title: 'Alice Channel', cover: null, description: 'hi' },
+    ]);
   });
 });

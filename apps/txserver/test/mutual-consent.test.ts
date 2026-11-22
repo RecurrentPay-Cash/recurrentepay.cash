@@ -38,6 +38,7 @@ import { NotificationService } from '../src/notifications/notification.service.j
 import { MutualConsentProposalRepository } from '../src/relay/mutual-consent-proposal.repository.js';
 import { MutualConsentService } from '../src/relay/mutual-consent.service.js';
 import type { CounterpartyInput, NewAssetInput } from '../src/relay/mutual-consent-builder.js';
+import { p2pkhAddress } from '../src/relay/mutual-consent-builder.js';
 import { signPrepared } from './client-signer.js';
 import { DAY, FUNDS_CAT, STATE_CAT, T, makeState } from './fixtures.js';
 
@@ -250,6 +251,43 @@ describe('MutualConsentService', () => {
     expect(prepared.signableInputs.map((s) => s.lockingBytecode)).toEqual(
       expect.arrayContaining([p2pkh(SUPPORTER_PKH), p2pkh(SUPPORTEE_PKH)]),
     );
+    // Each signable input carries the P2PKH address (the dapp maps it to an HD index).
+    expect(prepared.signableInputs.map((s) => s.address)).toEqual(
+      expect.arrayContaining([
+        p2pkhAddress(p2pkh(SUPPORTER_PKH)),
+        p2pkhAddress(p2pkh(SUPPORTEE_PKH)),
+      ]),
+    );
+    // `sourceOutputs` is positional: covenant state, escrow, then the two presence inputs.
+    const decodedPrepared = decodeTransaction(hexToBin(prepared.unsignedHex));
+    if (typeof decodedPrepared === 'string') throw new Error(decodedPrepared);
+    expect(prepared.sourceOutputs).toHaveLength(decodedPrepared.inputs.length);
+    expect(prepared.sourceOutputs[0]).toMatchObject({
+      outpointTransactionHash: CO_TXID,
+      outpointIndex: 1,
+      unlockingBytecode: '',
+      valueSatoshis: '20000',
+      token: { category: STATE_CAT, nft: { capability: 'mutable' } },
+    });
+    expect(prepared.sourceOutputs[1]).toMatchObject({
+      outpointTransactionHash: CO_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '20000',
+      token: { category: FUNDS_CAT },
+    });
+    expect(prepared.sourceOutputs[2]).toMatchObject({
+      outpointTransactionHash: INIT_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '1000000',
+    });
+    expect(prepared.sourceOutputs[3]).toMatchObject({
+      outpointTransactionHash: CP_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '1000000',
+    });
     // The relay never broadcasts during prepare.
     expect(broadcastCalled).toBe(false);
     // The proposal is still pending (nothing signed yet).
@@ -286,9 +324,9 @@ describe('MutualConsentService', () => {
     });
 
     // The rebuilt state output carries the NEW supporter pkh (proof of rebuild).
-    const decoded = decodeTransaction(hexToBin(prepared.unsignedHex));
-    if (typeof decoded === 'string') throw new Error(decoded);
-    const stateOut = decoded.outputs.find(
+    const decodedPrepared2 = decodeTransaction(hexToBin(prepared.unsignedHex));
+    if (typeof decodedPrepared2 === 'string') throw new Error(decodedPrepared2);
+    const stateOut = decodedPrepared2.outputs.find(
       (o) => o.token?.nft !== undefined && binToHex(o.token.category) === STATE_CAT,
     );
     expect(stateOut).toBeDefined();
@@ -378,6 +416,25 @@ describe('MutualConsentService', () => {
 
     // Three signable inputs: both presence inputs + the funding input (all P2PKH).
     expect(prepared.signableInputs).toHaveLength(3);
+    // Each signable input carries the P2PKH address (the dapp maps it to an HD index).
+    expect(prepared.signableInputs.map((s) => s.address)).toEqual(
+      expect.arrayContaining([
+        p2pkhAddress(p2pkh(SUPPORTER_PKH)),
+        p2pkhAddress(p2pkh(SUPPORTEE_PKH)),
+      ]),
+    );
+    // `sourceOutputs` is positional: covenant state, escrow, the new-asset funding
+    // input, then the two presence inputs.
+    const decodedPrepared = decodeTransaction(hexToBin(prepared.unsignedHex));
+    if (typeof decodedPrepared === 'string') throw new Error(decodedPrepared);
+    expect(prepared.sourceOutputs).toHaveLength(decodedPrepared.inputs.length);
+    expect(prepared.sourceOutputs[2]).toMatchObject({
+      outpointTransactionHash: FUND_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '20000',
+      token: { category: NEW_CAT, amount: '20' },
+    });
 
     const signedHex = signPrepared(prepared.unsignedHex, prepared.signableInputs, {
       [p2pkh(SUPPORTER_PKH)]: SUPPORTER_KEY,
@@ -396,9 +453,9 @@ describe('MutualConsentService', () => {
     await expect(provider.sendRawTransaction(signedHex)).resolves.toBe(result.txid);
 
     // The rebuilt state output carries the NEW funds category.
-    const decoded = decodeTransaction(hexToBin(signedHex));
-    if (typeof decoded === 'string') throw new Error(decoded);
-    const stateOut = decoded.outputs.find(
+    const decodedSigned = decodeTransaction(hexToBin(signedHex));
+    if (typeof decodedSigned === 'string') throw new Error(decodedSigned);
+    const stateOut = decodedSigned.outputs.find(
       (o) => o.token?.nft !== undefined && binToHex(o.token.category) === STATE_CAT,
     );
     expect(stateOut).toBeDefined();

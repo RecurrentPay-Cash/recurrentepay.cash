@@ -24,14 +24,19 @@ import {
 import { hexToBin } from '@bitauth/libauth';
 import { deriveState, type SubscriptionStatus } from 'shared';
 import { Subscription } from '../db/subscription.entity.js';
+import { Pull } from '../db/pull.entity.js';
 import { SubscriptionRepository } from '../subscription/subscription.repository.js';
 import { AuthGuard, type AuthedRequest } from '../auth/auth.guard.js';
 import { AutoCancelPolicyRepository } from './auto-cancel-policy.repository.js';
 import { NotificationRepository } from '../notifications/notification.repository.js';
+import { NotificationReadRepository } from '../notifications/notification-read.repository.js';
+import { toView as toNotificationView } from './notifications.controller.js';
 import { ScheduledCancelService } from '../cancel/scheduled-cancel.service.js';
 import { OffchainService } from '../offchain/offchain.service.js';
 import { DiscoveryService } from '../discovery/discovery.service.js';
 import { OracleActionsService } from '../pull/oracle-actions.service.js';
+import { TokenActionsService } from '../pull/token-actions.service.js';
+import { PullRepository } from '../pull/pull.repository.js';
 import { parseId } from './query-id.js';
 
 /** Filtering query (§ Subscription filtering — basic). */
@@ -53,11 +58,14 @@ export class SubscriptionsController {
     private readonly repository: SubscriptionRepository,
     private readonly policies: AutoCancelPolicyRepository,
     private readonly notifications: NotificationRepository,
+    private readonly notificationReads: NotificationReadRepository,
     private readonly scheduledCancels: ScheduledCancelService,
     private readonly guard: AuthGuard,
     private readonly offchain: OffchainService,
     private readonly discovery: DiscoveryService,
     private readonly oracleActions: OracleActionsService,
+    private readonly tokenActions: TokenActionsService,
+    private readonly pulls: PullRepository,
   ) {}
 
   /** The caller's subscriptions, with derived fields and basic filtering. */
@@ -91,6 +99,9 @@ export class SubscriptionsController {
     if (role !== undefined) views = views.filter((v) => v.role === role);
     if (state !== undefined) views = views.filter((v) => v.status === state);
     if (linkedIds !== null) views = views.filter((v) => linkedIds.has(v.stateCategory));
+    // Attach plan/channel context (dapp-handoff §12) — batched, links only.
+    const context = await this.offchain.linkContextFor(views.map((v) => v.stateCategory));
+    views = views.map((v) => withContext(v, context.get(v.stateCategory)));
     return views;
   }
 
@@ -103,10 +114,29 @@ export class SubscriptionsController {
     const pkh = this.guard.caller(request);
     const row = await this.requireParty(stateCategory, pkh);
     const now = Math.floor(Date.now() / 1000);
-    const view = toView(row, pkh, now);
+    let view = toView(row, pkh, now);
     // History: the caller's notification log for this sub (newest first).
     view.history = await this.notifications.findBySubscription(stateCategory, 50);
+    // Plan/channel context (dapp-handoff §12) — links only.
+    const context = await this.offchain.linkContextFor([stateCategory]);
+    view = withContext(view, context.get(stateCategory));
     return view;
+  }
+
+  /**
+   * The caller's pull history for a subscription (dapp-handoff §13), newest
+   * first. Read from the `pull` table; party-scoped (404 for a non-party).
+   * Bigint columns are stored as strings and returned as decimal strings.
+   */
+  @Get(':stateCategory/pulls')
+  async pullsFor(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+  ): Promise<PullView[]> {
+    const pkh = this.guard.caller(request);
+    await this.requireParty(stateCategory, pkh);
+    const rows = await this.pulls.findBySubscription(stateCategory);
+    return rows.map(toPullView);
   }
 
   /** The caller's notification log for a subscription. */
@@ -117,7 +147,12 @@ export class SubscriptionsController {
   ) {
     const pkh = this.guard.caller(request);
     await this.requireParty(stateCategory, pkh);
-    return this.notifications.findBySubscription(stateCategory, 100);
+    const rows = await this.notifications.findBySubscription(stateCategory, 100);
+    const readAt = await this.notificationReads.readAtByNotification(
+      rows.map((r) => r.id),
+      pkh,
+    );
+    return rows.map((row) => toNotificationView(row, readAt.get(row.id) ?? null));
   }
 
   /**
@@ -204,6 +239,7 @@ export class SubscriptionsController {
       stateCategory,
       unsignedHex: built.hex,
       signableInputs: built.signableInputs,
+      sourceOutputs: built.sourceOutputs,
       gross: built.gross.toString(),
       fee: built.fee.toString(),
       payout: built.payout.toString(),
@@ -256,6 +292,7 @@ export class SubscriptionsController {
       stateCategory,
       unsignedHex: built.hex,
       signableInputs: built.signableInputs,
+      sourceOutputs: built.sourceOutputs,
       supporteeAmount: built.supporteeAmount.toString(),
       fee: built.fee.toString(),
       newFunds: built.newFunds.toString(),
@@ -328,6 +365,7 @@ export class SubscriptionsController {
       mode,
       unsignedHex: built.hex,
       signableInputs: built.signableInputs,
+      sourceOutputs: built.sourceOutputs,
       newOraclePkHash: built.newOraclePkHash,
       gross: built.gross.toString(),
       fee: built.fee.toString(),
@@ -382,6 +420,158 @@ export class SubscriptionsController {
       gross: result.gross.toString(),
       fee: result.fee.toString(),
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Token-path actions: fund / withdraw / reactivate (no oracle, no party key).
+  //
+  // These mirror the oracle routes but operate on the **token** covenant (two
+  // UTXOs: state NFT + co-created escrow). The server builds the tx against the
+  // current outpoints with unsigned P2PKH placeholders, returns the hex + the
+  // inputs the client must sign, and relays the client-signed tx. It holds no
+  // party key. `withdraw`/`reactivate` are supporter-only; `fund` is
+  // permissionless (any party to the sub may top it up).
+  // ---------------------------------------------------------------------------
+
+  /** Prepare a token **withdraw** (supporter only). Returns unsigned hex + signable inputs. */
+  @Post(':stateCategory/withdraw-token/prepare')
+  async prepareTokenWithdraw(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { supporterInput?: RawOracleInput; strayInputs?: RawTokenInput[] },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireSupporter(stateCategory, pkh);
+    const built = await this.tokenActions.buildTokenWithdraw(row, {
+      now: Math.floor(Date.now() / 1000),
+      supporterInput: parseOracleInput(body?.supporterInput),
+      strayInputs: parseTokenInputs(body?.strayInputs),
+    });
+    return {
+      stateCategory,
+      unsignedHex: built.hex,
+      signableInputs: built.signableInputs,
+      sourceOutputs: built.sourceOutputs,
+      gross: built.gross.toString(),
+      fee: built.fee.toString(),
+      payout: built.payout.toString(),
+      retained: built.retained.toString(),
+    };
+  }
+
+  /** Relay a **client-signed** token withdraw (verified + broadcast). */
+  @Post(':stateCategory/withdraw-token/broadcast')
+  async broadcastTokenWithdraw(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { signedHex?: string },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireSupporter(stateCategory, pkh);
+    if (typeof body?.signedHex !== 'string' || body.signedHex === '') {
+      throw new BadRequestException('signedHex is required');
+    }
+    const { txid } = await this.tokenActions.broadcastTokenWithdraw(
+      row,
+      body.signedHex,
+      Math.floor(Date.now() / 1000),
+    );
+    return { stateCategory, txid };
+  }
+
+  /** Prepare a token **reactivate** (supporter only, paused-only). */
+  @Post(':stateCategory/reactivate-token/prepare')
+  async prepareTokenReactivate(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { fundingInputs?: RawTokenInput[] },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireSupporter(stateCategory, pkh);
+    const fundingInputs = parseTokenInputs(body?.fundingInputs);
+    if (fundingInputs.length === 0) {
+      throw new BadRequestException('at least one fundingInput is required');
+    }
+    const built = await this.tokenActions.buildTokenReactivate(row, {
+      now: Math.floor(Date.now() / 1000),
+      fundingInputs,
+    });
+    return {
+      stateCategory,
+      unsignedHex: built.hex,
+      signableInputs: built.signableInputs,
+      sourceOutputs: built.sourceOutputs,
+      supporteeAmount: built.supporteeAmount.toString(),
+      fee: built.fee.toString(),
+      newFunds: built.newFunds.toString(),
+    };
+  }
+
+  /** Relay a **client-signed** token reactivate (verified + broadcast). */
+  @Post(':stateCategory/reactivate-token/broadcast')
+  async broadcastTokenReactivate(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { signedHex?: string },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireSupporter(stateCategory, pkh);
+    if (typeof body?.signedHex !== 'string' || body.signedHex === '') {
+      throw new BadRequestException('signedHex is required');
+    }
+    const { txid } = await this.tokenActions.broadcastTokenReactivate(
+      row,
+      body.signedHex,
+      Math.floor(Date.now() / 1000),
+    );
+    return { stateCategory, txid };
+  }
+
+  /** Prepare a token **fund** (permissionless top-up; any party). */
+  @Post(':stateCategory/fund-token/prepare')
+  async prepareTokenFund(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { funderInput?: RawTokenInput; strayInputs?: RawTokenInput[] },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireParty(stateCategory, pkh);
+    const funderInput = parseTokenInputs([body?.funderInput as RawTokenInput])[0];
+    if (funderInput === undefined) {
+      throw new BadRequestException('a funderInput is required');
+    }
+    const built = await this.tokenActions.buildTokenFund(row, {
+      now: Math.floor(Date.now() / 1000),
+      funderInput,
+      strayInputs: parseTokenInputs(body?.strayInputs),
+    });
+    return {
+      stateCategory,
+      unsignedHex: built.hex,
+      signableInputs: built.signableInputs,
+      sourceOutputs: built.sourceOutputs,
+      total: built.total.toString(),
+    };
+  }
+
+  /** Relay a **client-signed** token fund (verified + broadcast). */
+  @Post(':stateCategory/fund-token/broadcast')
+  async broadcastTokenFund(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { signedHex?: string },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireParty(stateCategory, pkh);
+    if (typeof body?.signedHex !== 'string' || body.signedHex === '') {
+      throw new BadRequestException('signedHex is required');
+    }
+    const { txid } = await this.tokenActions.broadcastTokenFund(
+      row,
+      body.signedHex,
+      Math.floor(Date.now() / 1000),
+    );
+    return { stateCategory, txid };
   }
 
   /**
@@ -485,6 +675,43 @@ function parseOracleInput(raw: RawOracleInput | undefined): {
   };
 }
 
+/** A raw token input supplied by the client (a funds-category UTXO; no key). */
+interface RawTokenInput {
+  txid?: string;
+  vout?: number;
+  satoshis?: string;
+  lockingBytecode?: string;
+  category?: string;
+  amount?: string;
+}
+
+/** Validate + normalise a caller-supplied token input (whitelist; drops extras). */
+function parseTokenInputs(raw: RawTokenInput[] | undefined): Array<{
+  txid: string;
+  vout: number;
+  satoshis: bigint;
+  lockingBytecode: string;
+  category: string;
+  amount: bigint;
+}> {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((entry) => {
+    const base = parseOracleInput(entry);
+    if (base === undefined) throw new BadRequestException('token input is required');
+    if (typeof entry.category !== 'string' || !/^[0-9a-f]{64}$/i.test(entry.category)) {
+      throw new BadRequestException('token input category must be a 32-byte category hex');
+    }
+    if (typeof entry.amount !== 'string' || !/^\d+$/.test(entry.amount)) {
+      throw new BadRequestException('token input amount must be a decimal string');
+    }
+    return {
+      ...base,
+      category: entry.category.toLowerCase(),
+      amount: BigInt(entry.amount),
+    };
+  });
+}
+
 /** The API view of a subscription: stored cache + clock-derived fields. */
 export interface SubscriptionView {
   stateCategory: string;
@@ -511,6 +738,56 @@ export interface SubscriptionView {
   owedPreSettle: string;
   futurePeriods: string;
   history?: unknown[];
+  /** Plan/channel context (dapp-handoff §12); omitted when the sub has no link. */
+  channelId?: number;
+  planId?: number;
+  planTitle?: string;
+  benefits?: string[];
+}
+
+/** The API view of a pull (dapp-handoff §13). */
+export interface PullView {
+  id: number;
+  txid: string;
+  periodsSettled: string;
+  gross: string;
+  fee: string;
+  broadcastAt: number;
+  status: string;
+}
+
+/**
+ * Project a `pull` row to its API view. Bigint columns are stored as strings in
+ * Postgres but come back as numbers from SQLite — `String(...)` normalises both
+ * to the decimal-string contract the web app expects.
+ */
+export function toPullView(row: Pull): PullView {
+  return {
+    id: row.id,
+    txid: row.txid,
+    periodsSettled: String(row.periodsSettled),
+    gross: String(row.gross),
+    fee: String(row.fee),
+    broadcastAt: row.broadcastAt,
+    status: row.status,
+  };
+}
+
+/** Attach plan/channel context to a view, leaving fields absent when no link. */
+function withContext(
+  view: SubscriptionView,
+  context:
+    | { channelId: number; planId: number | null; planTitle?: string; benefits?: string[] }
+    | undefined,
+): SubscriptionView {
+  if (context === undefined) return view;
+  return {
+    ...view,
+    channelId: context.channelId,
+    planId: context.planId ?? undefined,
+    planTitle: context.planTitle,
+    benefits: context.benefits,
+  };
 }
 
 /** Compute the view for a row, deriving status/arrears/future-periods at `now`. */

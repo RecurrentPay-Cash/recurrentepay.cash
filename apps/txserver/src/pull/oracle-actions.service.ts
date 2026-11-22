@@ -87,7 +87,8 @@ import { oracle, toInternalCategory, type oracle as OracleNs } from 'shared';
 import type { Subscription } from '../db/subscription.entity.js';
 import { OracleClientService } from '../oracle/oracle-client.service.js';
 import { SubscriptionRepository } from '../subscription/subscription.repository.js';
-import type { CounterpartyInput, SignableInput } from '../relay/mutual-consent-builder.js';
+import type { CounterpartyInput, SignableInput, SourceOutput } from '../relay/mutual-consent-builder.js';
+import { p2pkhAddress, sourceOutputsOf } from '../relay/mutual-consent-builder.js';
 import type { PullExecutorConfig } from './pull-executor.service.js';
 
 /** Thrown when a fresh oracle message is unavailable — the caller retries. */
@@ -136,6 +137,8 @@ export interface BuiltOracleWithdraw {
   nextState: OracleNs.OracleState;
   /** The supporter presence input the client must sign (P2PKH). */
   signableInputs: SignableInput[];
+  /** Positional source outputs (one per tx input, in tx order) for WizardConnect. */
+  sourceOutputs: SourceOutput[];
 }
 
 export interface BuildOracleReactivateOptions {
@@ -166,6 +169,8 @@ export interface BuiltOracleReactivate {
   nextState: OracleNs.OracleState;
   /** The funding input(s) the client must sign (P2PKH). */
   signableInputs: SignableInput[];
+  /** Positional source outputs (one per tx input, in tx order) for WizardConnect. */
+  sourceOutputs: SourceOutput[];
 }
 
 /**
@@ -212,6 +217,8 @@ export interface BuiltOracleMigrate {
   nextState: OracleNs.OracleState;
   /** The presence input(s) the client must sign (P2PKH); empty in `service` mode. */
   signableInputs: SignableInput[];
+  /** Positional source outputs (one per tx input, in tx order) for WizardConnect. */
+  sourceOutputs: SourceOutput[];
 }
 
 @Injectable()
@@ -312,6 +319,7 @@ export class OracleActionsService {
         index,
         lockingBytecode: options.supporterInput.lockingBytecode.toLowerCase(),
         satoshis: options.supporterInput.satoshis.toString(),
+        address: p2pkhAddress(options.supporterInput.lockingBytecode),
       });
     }
     const serviceLock = this.serviceLock();
@@ -329,6 +337,7 @@ export class OracleActionsService {
       retained,
       nextState,
       signableInputs,
+      sourceOutputs: sourceOutputsOf(tx.inputs),
     };
   }
 
@@ -409,6 +418,7 @@ export class OracleActionsService {
         index,
         lockingBytecode: funding.lockingBytecode.toLowerCase(),
         satoshis: funding.satoshis.toString(),
+        address: p2pkhAddress(funding.lockingBytecode),
       });
     }
 
@@ -443,6 +453,7 @@ export class OracleActionsService {
       newFunds,
       nextState,
       signableInputs,
+      sourceOutputs: sourceOutputsOf(tx.inputs),
     };
   }
 
@@ -558,6 +569,7 @@ export class OracleActionsService {
           index,
           lockingBytecode: input.lockingBytecode.toLowerCase(),
           satoshis: input.satoshis.toString(),
+          address: p2pkhAddress(input.lockingBytecode),
         });
       }
       const serviceLock = this.serviceLock();
@@ -580,6 +592,7 @@ export class OracleActionsService {
       newOraclePkHash,
       nextState,
       signableInputs,
+      sourceOutputs: sourceOutputsOf(tx.inputs),
     };
   }
 

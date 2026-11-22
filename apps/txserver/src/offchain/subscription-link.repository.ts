@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { SubscriptionLink } from '../db/subscription-link.entity.js';
 
 /** The fields a plan → subscription link records. */
@@ -41,6 +41,12 @@ export class SubscriptionLinkRepository {
 
   async findBySubscription(subscriptionId: string): Promise<SubscriptionLink | null> {
     return this.repo.findOne({ where: { subscriptionId } });
+  }
+
+  /** Links for a batch of subscriptions (the plan-context join, dapp-handoff §12). */
+  async findBySubscriptions(subscriptionIds: string[]): Promise<SubscriptionLink[]> {
+    if (subscriptionIds.length === 0) return [];
+    return this.repo.find({ where: { subscriptionId: In(subscriptionIds) } });
   }
 
   /**

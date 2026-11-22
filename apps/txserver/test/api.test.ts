@@ -20,6 +20,7 @@ import { AuthGuard } from '../src/auth/auth.guard.js';
 import { SubscriptionsController } from '../src/api/subscriptions.controller.js';
 import { DiscoveryService } from '../src/discovery/discovery.service.js';
 import { OracleActionsService } from '../src/pull/oracle-actions.service.js';
+import { TokenActionsService } from '../src/pull/token-actions.service.js';
 import { NotificationsController } from '../src/api/notifications.controller.js';
 import { WebhooksController } from '../src/api/webhooks.controller.js';
 import { AuthController } from '../src/api/auth.controller.js';
@@ -27,7 +28,9 @@ import { WebhookEndpointRepository } from '../src/notifications/webhook-endpoint
 import { AutoCancelPolicyRepository } from '../src/api/auto-cancel-policy.repository.js';
 import { AutoCancelPolicy } from '../src/db/auto-cancel-policy.entity.js';
 import { NotificationRepository } from '../src/notifications/notification.repository.js';
+import { NotificationReadRepository } from '../src/notifications/notification-read.repository.js';
 import { Notification } from '../src/db/notification.entity.js';
+import { NotificationRead } from '../src/db/notification-read.entity.js';
 import { WebhookEndpoint } from '../src/db/webhook-endpoint.entity.js';
 import { Cancel } from '../src/db/cancel.entity.js';
 import { ScheduledCancel } from '../src/db/scheduled-cancel.entity.js';
@@ -38,10 +41,14 @@ import { Account } from '../src/db/account.entity.js';
 import { Channel } from '../src/db/channel.entity.js';
 import { Plan } from '../src/db/plan.entity.js';
 import { SubscriptionLink } from '../src/db/subscription-link.entity.js';
+import { Pull } from '../src/db/pull.entity.js';
+import { PullRepository } from '../src/pull/pull.repository.js';
 import { AccountRepository } from '../src/offchain/account.repository.js';
 import { ChannelRepository } from '../src/offchain/channel.repository.js';
 import { PlanRepository } from '../src/offchain/plan.repository.js';
 import { SubscriptionLinkRepository } from '../src/offchain/subscription-link.repository.js';
+import { ChannelAutoCancelPolicyRepository } from '../src/offchain/channel-policy.repository.js';
+import { ChannelAutoCancelPolicy } from '../src/db/channel-auto-cancel-policy.entity.js';
 import { OffchainService } from '../src/offchain/offchain.service.js';
 import { DAY, FUNDS_CAT, STATE_CAT, T } from './fixtures.js';
 
@@ -79,6 +86,7 @@ describe('REST API', () => {
   let app: INestApplication;
   let dataSource: DataSource;
   let repository: SubscriptionRepository;
+  let pulls: PullRepository;
   let challenges: ChallengeService;
   let aToken: string;
 
@@ -120,6 +128,7 @@ describe('REST API', () => {
         Subscription,
         AutoCancelPolicy,
         Notification,
+        NotificationRead,
         WebhookEndpoint,
         Cancel,
         ScheduledCancel,
@@ -127,15 +136,21 @@ describe('REST API', () => {
         Channel,
         Plan,
         SubscriptionLink,
+        ChannelAutoCancelPolicy,
+        Pull,
       ],
       synchronize: true,
     });
     await dataSource.initialize();
     repository = new SubscriptionRepository(dataSource.getRepository(Subscription));
+    pulls = new PullRepository(dataSource.getRepository(Pull));
     challenges = new ChallengeService();
     const sessions = new SessionService(challenges);
     const policies = new AutoCancelPolicyRepository(dataSource.getRepository(AutoCancelPolicy));
     const notifications = new NotificationRepository(dataSource.getRepository(Notification));
+    const notificationReads = new NotificationReadRepository(
+      dataSource.getRepository(NotificationRead),
+    );
     const webhooks = new WebhookEndpointRepository(dataSource.getRepository(WebhookEndpoint));
     const guard = new AuthGuard(sessions);
     const cancels = new CancelRepository(dataSource.getRepository(Cancel));
@@ -156,6 +171,7 @@ describe('REST API', () => {
       new ChannelRepository(dataSource.getRepository(Channel)),
       new PlanRepository(dataSource.getRepository(Plan)),
       new SubscriptionLinkRepository(dataSource.getRepository(SubscriptionLink)),
+      new ChannelAutoCancelPolicyRepository(dataSource.getRepository(ChannelAutoCancelPolicy)),
     );
 
     const moduleRef = await Test.createTestingModule({
@@ -170,6 +186,7 @@ describe('REST API', () => {
         { provide: SubscriptionRepository, useValue: repository },
         { provide: AutoCancelPolicyRepository, useValue: policies },
         { provide: NotificationRepository, useValue: notifications },
+        { provide: NotificationReadRepository, useValue: notificationReads },
         { provide: WebhookEndpointRepository, useValue: webhooks },
         { provide: ScheduledCancelService, useValue: scheduledCancels },
         { provide: OffchainService, useValue: offchain },
@@ -178,6 +195,8 @@ describe('REST API', () => {
         { provide: AuthGuard, useValue: guard },
         { provide: DiscoveryService, useValue: { discover: async () => ({ tracked: false, reason: "test" }) } },
         { provide: OracleActionsService, useValue: {} },
+        { provide: TokenActionsService, useValue: {} },
+        { provide: PullRepository, useValue: pulls },
       ],
     }).compile();
 
@@ -194,9 +213,11 @@ describe('REST API', () => {
     await dataSource.getRepository(Subscription).clear();
     await dataSource.getRepository(AutoCancelPolicy).clear();
     await dataSource.getRepository(Notification).clear();
+    await dataSource.getRepository(NotificationRead).clear();
     await dataSource.getRepository(WebhookEndpoint).clear();
     await dataSource.getRepository(ScheduledCancel).clear();
     await dataSource.getRepository(SubscriptionLink).clear();
+    await dataSource.getRepository(Pull).clear();
     await dataSource.getRepository(Plan).clear();
     await dataSource.getRepository(Channel).clear();
     await dataSource.getRepository(Account).clear();
@@ -558,5 +579,121 @@ describe('REST API', () => {
       .getRepository(ScheduledCancel)
       .findOneByOrFail({ subscriptionId: STATE_CAT });
     expect(row.state).toBe('revoked');
+  });
+
+  it('serves the pull history newest-first with decimal-string amounts', async () => {
+    await seedSubscription({ stateCategory: STATE_CAT, supporterPkh: A_PKH });
+    await pulls.insert({
+      subscriptionId: STATE_CAT,
+      txid: 'aa'.repeat(32),
+      periodsSettled: 1n,
+      gross: 10n,
+      fee: 1n,
+      broadcastAt: NOW - 2 * DAY,
+    });
+    await pulls.insert({
+      subscriptionId: STATE_CAT,
+      txid: 'bb'.repeat(32),
+      periodsSettled: 2n,
+      gross: 20n,
+      fee: 2n,
+      broadcastAt: NOW - DAY,
+    });
+
+    const res = await request(app.getHttpServer())
+      .get(`/subscriptions/${STATE_CAT}/pulls`)
+      .set('Authorization', `Bearer ${aToken}`)
+      .expect(200);
+
+    expect(res.body).toHaveLength(2);
+    // Newest first (higher id).
+    expect(res.body[0]).toMatchObject({
+      txid: 'bb'.repeat(32),
+      periodsSettled: '2',
+      gross: '20',
+      fee: '2',
+      broadcastAt: NOW - DAY,
+      status: 'accepted',
+    });
+    expect(res.body[1].txid).toBe('aa'.repeat(32));
+  });
+
+  it('rejects an unauthenticated pull history read', async () => {
+    await request(app.getHttpServer()).get(`/subscriptions/${STATE_CAT}/pulls`).expect(401);
+  });
+
+  it('does not leak another party pull history', async () => {
+    await seedSubscription({ stateCategory: OTHER_CAT, supporterPkh: B_PKH });
+    await request(app.getHttpServer())
+      .get(`/subscriptions/${OTHER_CAT}/pulls`)
+      .set('Authorization', `Bearer ${aToken}`)
+      .expect(404);
+  });
+
+  it('404s the pull history for an unknown subscription', async () => {
+    await request(app.getHttpServer())
+      .get(`/subscriptions/${OTHER_CAT}/pulls`)
+      .set('Authorization', `Bearer ${aToken}`)
+      .expect(404);
+  });
+
+  it('attaches plan context to list and detail when a subscription_link exists', async () => {
+    await seedSubscription({ stateCategory: STATE_CAT, supporterPkh: A_PKH });
+    const account = await dataSource
+      .getRepository(Account)
+      .save(dataSource.getRepository(Account).create({ pkh: A_PKH }));
+    const channel = await dataSource
+      .getRepository(Channel)
+      .save(dataSource.getRepository(Channel).create({ ownerAccountId: account.id, title: 'Chan' }));
+    const plan = await dataSource.getRepository(Plan).save(
+      dataSource.getRepository(Plan).create({
+        channelId: channel.id,
+        title: 'Gold plan',
+        amount: '10',
+        period: DAY,
+        benefits: ['Priority support', 'No ads'],
+      }),
+    );
+    await dataSource.getRepository(SubscriptionLink).save(
+      dataSource.getRepository(SubscriptionLink).create({
+        subscriptionId: STATE_CAT,
+        channelId: channel.id,
+        planId: plan.id,
+      }),
+    );
+
+    const list = await request(app.getHttpServer())
+      .get('/subscriptions')
+      .set('Authorization', `Bearer ${aToken}`)
+      .expect(200);
+    expect(list.body[0]).toMatchObject({
+      channelId: channel.id,
+      planId: plan.id,
+      planTitle: 'Gold plan',
+      benefits: ['Priority support', 'No ads'],
+    });
+
+    const detail = await request(app.getHttpServer())
+      .get(`/subscriptions/${STATE_CAT}`)
+      .set('Authorization', `Bearer ${aToken}`)
+      .expect(200);
+    expect(detail.body).toMatchObject({
+      channelId: channel.id,
+      planId: plan.id,
+      planTitle: 'Gold plan',
+      benefits: ['Priority support', 'No ads'],
+    });
+  });
+
+  it('omits plan context for a subscription with no link', async () => {
+    await seedSubscription({ stateCategory: STATE_CAT, supporterPkh: A_PKH });
+    const res = await request(app.getHttpServer())
+      .get(`/subscriptions/${STATE_CAT}`)
+      .set('Authorization', `Bearer ${aToken}`)
+      .expect(200);
+    expect(res.body.planTitle).toBeUndefined();
+    expect(res.body.channelId).toBeUndefined();
+    expect(res.body.planId).toBeUndefined();
+    expect(res.body.benefits).toBeUndefined();
   });
 });

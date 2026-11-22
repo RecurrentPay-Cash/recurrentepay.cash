@@ -48,6 +48,11 @@ export class PullRepository {
     return this.repo.findOne({ where: { subscriptionId }, order: { id: 'DESC' } });
   }
 
+  /** Every pull for a subscription, newest first (the API history view). */
+  async findBySubscription(subscriptionId: string): Promise<Pull[]> {
+    return this.repo.find({ where: { subscriptionId }, order: { id: 'DESC' } });
+  }
+
   /**
    * Mark a pull `failed` after a broadcast error (spec § Postgres schema — the
    * `failed` status). Keeps the audit log honest: the row was written before the

@@ -43,17 +43,24 @@ describe('Demo seed', () => {
     await dataSource.getRepository(Account).clear();
   });
 
-  it('creates a demo channel with plans', async () => {
+  it('creates two demo channels with stable ids (1 = RecurrentPay.Cash, 2 = Alice)', async () => {
     const result = await seed.seed();
     expect(result.created).toBe(true);
     expect(result.planIds.length).toBeGreaterThan(0);
 
-    const channels = await dataSource.getRepository(Channel).find();
-    expect(channels).toHaveLength(1);
-    expect(channels[0]?.title).toBe('Demo Creator');
+    const channels = await dataSource.getRepository(Channel).find({ order: { id: 'ASC' } });
+    expect(channels).toHaveLength(2);
+    // Stable ids: the picker links to /channels/1 and /channels/2.
+    expect(channels.map((c) => c.id)).toEqual([1, 2]);
+    expect(channels.map((c) => c.title)).toEqual(['RecurrentPay.Cash', 'Alice']);
+
+    // The result exposes every seeded channel (id + title), in stable order.
+    expect(result.channels.map((c) => c.title)).toEqual(['RecurrentPay.Cash', 'Alice']);
+    expect(result.channels[0]?.id).toBe(channels[0]?.id);
+    expect(result.channels[1]?.id).toBe(channels[1]?.id);
 
     const plans = await dataSource.getRepository(Plan).find();
-    expect(plans.length).toBe(result.planIds.length);
+    expect(plans.length).toBeGreaterThan(result.planIds.length);
     expect(plans.every((p) => p.visible)).toBe(true);
   });
 
@@ -64,9 +71,10 @@ describe('Demo seed', () => {
     expect(second.created).toBe(false);
     expect(second.channelId).toBe(first.channelId);
     expect(second.planIds).toEqual(first.planIds);
+    expect(second.channels).toEqual(first.channels);
 
-    expect(await dataSource.getRepository(Channel).count()).toBe(1);
-    expect(await dataSource.getRepository(Plan).count()).toBe(first.planIds.length);
-    expect(await dataSource.getRepository(Account).count()).toBe(1);
+    expect(await dataSource.getRepository(Channel).count()).toBe(2);
+    expect(await dataSource.getRepository(Plan).count()).toBe(4);
+    expect(await dataSource.getRepository(Account).count()).toBe(2);
   });
 });

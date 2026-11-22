@@ -44,6 +44,11 @@ export class NotificationRepository {
     return this.repo.findOne({ where: { idempotencyKey: key } });
   }
 
+  /** A single notification by id (read-state marking), or `null`. */
+  async findById(id: number): Promise<Notification | null> {
+    return this.repo.findOne({ where: { id } });
+  }
+
   /** The most recent row (test helper / diagnostics). */
   async latest(): Promise<Notification | null> {
     return this.repo.findOne({ where: {}, order: { id: 'DESC' } });

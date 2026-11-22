@@ -11,6 +11,8 @@ export interface PlanUpsert {
   amount: bigint;
   period: number;
   asset?: string;
+  /** Display denomination (`BCH` | `PUSD` | `MUSD` | `USD` | `XAU`), or null. */
+  unit?: string | null;
   benefits?: string[] | null;
   defaultMode?: number;
 }
