@@ -9,7 +9,10 @@
     "node": ">=20.10"
   },
   "scripts": {
-    "test": "pnpm --filter contracts test",
-    "build": "pnpm --filter contracts build"
+    "test": "pnpm -r test",
+    "build": "pnpm -r build"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["better-sqlite3"]
   }
 }
