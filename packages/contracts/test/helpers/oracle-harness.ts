@@ -376,6 +376,14 @@ export class Scenario {
     };
   }
 
+  /** Total token units of `category` (display order) held by `role`. */
+  async readRoleTokens(role: Role, category: string): Promise<bigint> {
+    const utxos = await this.provider.getUtxosForLockingBytecode(role.lock);
+    return utxos
+      .filter((u) => u.token?.category === category)
+      .reduce((sum, u) => sum + (u.token?.amount ?? 0n), 0n);
+  }
+
   covenantLock(): Uint8Array {
     return hexToBin(this.contract.lockingBytecode);
   }

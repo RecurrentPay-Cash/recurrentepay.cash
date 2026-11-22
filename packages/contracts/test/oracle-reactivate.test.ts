@@ -6,7 +6,7 @@
  * Covers tasks 3.3, 3.4, 4.19. `reactivate` does NOT call `settleOracle()`: it pays
  * the whole balance except DUST, waives the rest, promotes terms, stays on the grid.
  */
-import { MODE_A, MODE_B, DUST, scenario, type Scenario } from './helpers/oracle-harness.js';
+import { MODE_A, MODE_B, DUST, encodeCommitment, scenario, type Scenario } from './helpers/oracle-harness.js';
 import { requireError } from './helpers/expect.js';
 
 const T = 1_764_000_000;
@@ -28,13 +28,22 @@ const base = (over: Partial<Parameters<typeof scenario>[0]> = {}): Scenario =>
 
 describe('reactivate (waive arrears, promote terms, stay on the grid)', () => {
   it('is rejected while the subscription is funded', async () => {
+    // Funded ⟺ balance ≥ payable. Here balance 5,000,000 ≥ payable 1,000,000,
+    // so the covenant must reject with its own gate (contract:564). Built by
+    // hand: the canonical harness builder assumes a paused sub and would produce
+    // a negative state output.
     const sub = base({ balance: 5_000_000n });
-    sub.advance(3 * DAY);
-    // newFunds = stateOut − balance; a funded sub's state output is smaller than
-    // the input, so the harness cannot build it. Assert the gate directly instead.
+    sub.advance(DAY);
     const s = sub.settlement(PRICE);
-    expect(s.payable).toBe(3_000_000n);
     expect(sub.currentBalance >= s.payable).toBe(true);
+    const args = sub.oracleArgs({ price: Number(PRICE) });
+    const tx = sub.base(() => sub.unlock()['reactivate']!(args.sig, args.message, args.pubkey));
+    // The gate fires before any output is inspected, so a minimal funding input
+    // and a state output are enough to reach it.
+    tx.addInput(sub.input(sub.supporter, GPP5), sub.supporter.template.unlockP2PKH());
+    tx.addOutput(sub.stateOutput(encodeCommitment(sub.state), sub.currentBalance + GPP5 - 5000n));
+    const { message } = await requireError(tx.addBchChangeOutputIfNeeded({ to: sub.supporter.lock, feeRate: 1 }));
+    expect(message).toMatch(/reactivate: rejected while funded/);
   });
 
   it('pays the whole balance except DUST when paused (mode B, m = 0)', async () => {
@@ -65,6 +74,10 @@ describe('reactivate (waive arrears, promote terms, stay on the grid)', () => {
     // supportee = spendable + gppNew − fee = 399,000 + 1,000,000 − fee.
     // fee = m·perPeriodFee(gppOld) + perPeriodFee(gppNew); m = 399,000/1,000,000 = 0 → fee = 10,000.
     expect(await sub.readRolePaidSats(sub.supportee)).toBe(1_389_000n);
+    // The service fee output is asserted too: even at m = 0 the prepaid (mode A)
+    // period is charged perPeriodFee(gppNew) = 1% of 1,000,000 = 10,000 sats.
+    // (Spec § Service fee vs contract:564: code charges the prepaid period's fee.)
+    expect(await sub.readRolePaidSats(sub.service)).toBeGreaterThanOrEqual(10_000n);
   });
 
   it('stays on the grid (no drift)', async () => {

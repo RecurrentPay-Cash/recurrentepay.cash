@@ -106,12 +106,14 @@ describe('pull (oracle, m-period catch-up)', () => {
   });
 
   it('cannot advance the clock without payment (dust-only balance)', async () => {
-    const sub = base({ balance: DUST });
+    // balance just above DUST → spendable = 1000 < grossPerPeriod (2,000,000) → m = 0.
+    // The clock is past the boundary, so the only failing gate is `gross > 0`
+    // (contract:347): a settle that pays nothing must not happen.
+    const sub = base({ balance: DUST + 1000n });
     sub.advance(5 * DAY);
-    // The harness cannot even build a dust-only state output (below the 546-sat
-    // minimum), so assert the settlement pays nothing instead.
     expect(sub.settlement(PRICE).gross).toBe(0n);
-    expect(sub.state.lastPeriodTime).toBe(T);
+    const { message } = await requireError(sub.pull(PRICE));
+    expect(message).toMatch(/pull: balance does not cover a period/);
   });
 
   it('single-UTXO balance discipline: extra BCH inputs are not counted as balance', async () => {
