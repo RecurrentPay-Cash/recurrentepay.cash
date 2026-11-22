@@ -52,6 +52,15 @@ event and disclosed in the README and submission, per hackathon rules.
 - **Linked Taiga stories:**
   - **Contracts Prep** (milestone 1): US #1–#6 — toolchain, token contract (core + advanced), oracle contract, test suite, freeze + smoke
   - **BCH BLAZE Hackathon** (milestone 2): US #7–#19 — monorepo, shared pkg, txserver (watcher/executor/API), web app (connect/create/dashboard/detail), E2E, receipts (cuttable), deploy, submission
+  - **Deferred review findings** (milestone 2): US #20–#23 — from `packages/contracts/reviews/2026-11-21-txserver-slice1.md`:
+    - US #20 — deterministic contract artifact timestamp (chore, minor)
+    - US #21 — SQLite/Postgres schema-drift guard in CI (chore, minor)
+    - US #22 — wire `subscription.asset_type` when oracle subs land, Slice 3 (task, minor)
+    - US #23 — revisit dead `deriveState`/`deriveEscrow` `seed` param (task, nit)
+  - **Deferred review findings** (milestone 2): US #24–#26 — from `packages/contracts/reviews/2026-11-21-txserver-slice2.md`:
+    - US #24 — wire `DiscoveryService` to the watcher `onChange` (derived-state cycle), Slice 3 (task, major)
+    - US #25 — distinguish `'closed'` from `'not connected'` on post-close calls (chore, nit)
+    - US #26 — expose watcher readiness / surface initial-connect failure (task, minor)
 
 ## Stretch (MVP, sequence after the demo path)
 

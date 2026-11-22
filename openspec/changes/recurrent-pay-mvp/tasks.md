@@ -130,20 +130,27 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
 ## Sprint 2 — Hackathon (Nov 14–22)
 
 ### 6. Monorepo bootstrap (Nov 14)
-- [ ] 6.1 Init monorepo: pnpm workspaces, apps/web, apps/txserver, packages/contracts, packages/shared
+- [x] 6.1 Init monorepo: pnpm workspaces, apps/web, apps/txserver, packages/contracts, packages/shared
 - [ ] 6.2 Import contracts repo (fork/merge), README disclosure, LICENSE
 - [ ] 6.3 CI: GitHub Actions (install→lint→test→build)
 - [ ] 6.4 docker-compose dev: postgres + fulcrum (chipnet)
 - [ ] 6.5 AGENTS.md + DESIGN.md placeholder (impeccable init when UI starts)
 
 ### 7. Shared package
-- [ ] 7.1 Commitment codec (parse/serialize), types, constants (fee percent, min fee, seed, buffers)
+
+> **Slice 1 scope (txserver walking skeleton):** 7.1, 7.4, 7.5 land in Slice 1 (codec/constants,
+> escrow-derivation helper, fee helper, settlement mirror). 7.2/7.3 follow with the codec round-trip
+> tests. 7.6 (creation builder) is a dependency of the **web app + E2E**, not of Slice 1 — the
+> derived-state engine needs only the codec and the escrow helper. Re-export the contracts package's
+> `commitment.ts`/`constants.ts` rather than forking them (single source of truth; DRY).
+
+- [x] 7.1 Commitment codec (parse/serialize), types, constants (fee percent, min fee, seed, buffers)
 - [ ] 7.2 Contract artifact loading helpers (network-aware)
 - [ ] 7.3 Unit tests for codec round-trips
-- [ ] 7.4 **Escrow derivation helper** — `escrow` = the funds UTXO co-created with the state NFT
+- [x] 7.4 **Escrow derivation helper** — `escrow` = the funds UTXO co-created with the state NFT
   (matching `outpointTransactionHash`), `spendable = escrow − seed`; the single source of truth
   shared by web, txserver and tests (parity with the contract's own derivation)
-- [ ] 7.5 Fee helper — `perPeriodFee = max(amount·SERVICE_FEE_PERCENT/100, MIN_FEE_PER_PERIOD)`,
+- [x] 7.5 Fee helper — `perPeriodFee = max(amount·SERVICE_FEE_PERCENT/100, MIN_FEE_PER_PERIOD)`,
   `fee = m·perPeriodFee`; unit tests incl. the floor crossover
 - [ ] 7.6 **Creation builder** — the two-tx flow: build carrier `P` (output 0 = genesis carrier),
   sign, hash → `stateCategory`, derive the covenant address, build creation `C` (one `mutable` state
@@ -152,22 +159,137 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
   unit-test the category/address derivation against the signed carrier bytes
 
 ### 8. TxServer (NestJS)
-- [ ] 8.1 Scaffold NestJS app, config module (env secrets), Postgres + migrations
-- [ ] 8.2 Chain watcher: Electrum client, outpoint subscriptions (state + escrow, re-resolved per
+
+> **Slice plan (walking skeleton first):**
+> **S1** scaffold+config+migrations(`subscription`)+health (8.1), derived-state engine (8.3),
+> future-periods (8.16), `ChainWatcher` interface + in-memory mock (8.2 partial) →
+> **S2** real Electrum/Fulcrum watcher + discovery + genesis validation (8.2, 8.11) →
+> **S3** pull executor + scheduler + oracle client (8.4, 8.5, 8.6) →
+> **S4** REST API + auth + notifications/webhook (8.7, 8.13) →
+> **S5** cancel paths — auto-cancel, scheduled cancel, stray sweep, platform auth (8.9, 8.10, 8.12) →
+> **S6** off-chain CRUD + filtering + demo seed (8.15, 8.18, 8.19) →
+> **S7** mutual-consent relay (8.17).
+> 8.14 grows table-by-table per slice (Slice 1 = `subscription` only). S1 is strictly non-blocking on
+> the oracle contract (token-sub semantics only; `asset_type` column reserved for oracle subs).
+
+- [x] 8.1 Scaffold NestJS app, config module (env secrets incl. platform service key), Postgres + migrations
+  — **Slice 1:** scaffold + config + migrations starting with the `subscription` table + `GET /health`
+- [x] 8.2 Chain watcher: Electrum client, outpoint subscriptions (state + escrow, re-resolved per
   spend), **0-conf (mempool) subscriptions** — react on broadcast acceptance, not block
-  confirmation — stray detection, event handling
-- [ ] 8.3 Derived state engine: status computation (escrow-based), next-payment estimate, caching
-- [ ] 8.4 Oracle client: oracles.cash REST fetch + validation
-- [ ] 8.5 Pull executor: build/sign/broadcast, idempotency guard
-- [ ] 8.6 Scheduler: due scan loop, buffer-warning trigger
-- [ ] 8.7 REST API: subscriptions by party, detail (incl. arrears `n'`), notifications, auto-cancel policy config
-- [ ] 8.8 Tests: cycle logic, idempotency, degradation paths, escrow-derivation parity with the contract
-- [ ] 8.9 Auto-cancel policy (supportee opt-in): inactive-period threshold, pre-fire notification + grace window, top-up cancels the policy
-- [ ] 8.10 **Consolidation sweep** — fold stray funds UTXOs into the escrow (`fund`) and clear
-  foreign tokens to the supporter, so cancel cannot strand them
-- [ ] 8.11 **Genesis validation** — on discovery, validate the genesis tx (one `mutable` state NFT,
+  confirmation — stray detection, reorg reconciliation, event handling
+  — **Slice 1:** define the `ChainWatcher` interface + an in-memory mock implementation (no live
+  node) so the derived-state engine and cycle logic are unit-testable; the real Electrum client is Slice 2
+  — **Slice 2:** real Electrum/Fulcrum client (raw TCP JSON-RPC, `blockchain.scripthash.*`),
+  0-conf subscriptions, escrow re-resolution per spend, stray classification, reorg re-derivation
+- [x] 8.3 Derived state engine: status computation (escrow-based), next-payment estimate, caching
+  — **Slice 1:** pure functions — `n`/`payable`/`owedPreSettle`, `m`, future-periods
+  `floor(escrow/amount)`, status ∈ {active, paused, due, canceled}, next-payment estimate;
+  escrow-only balance (never `totalIn`), parity with `packages/contracts/src/commitment.ts`
+- [x] 8.4 Oracle client: General Protocols relay REST fetch + validation (+ audit table)
+  — **Slice 3b:** GP 16-byte message codec (`gp-message.ts`), `OracleClientService`
+  (injectable HTTP client, `oraclePkHash`→pubkey mapping via `hash160`, **Schnorr signature
+  verification over `sha256(message)`** — the same preimage as the contract's `checkDataSig` —
+  freshness bounds: `timestamp ≤ now`, `timestamp ≥ lastPeriodTime + n·period`,
+  `now − timestamp ≤ 1h`, `contentSequence > 0`; degrades safely on
+  unreachable/non-2xx/empty/bad-signature), `oracle_message` audit table +
+  `subscription.oracle_pk_hash`/`oracle_pubkey`/`last_rate` columns (migration `1700000000002`),
+  `OracleModule`. Default relay `https://oracles.generalprotocols.com/api/v1`. BCH pull-tx builder
+  is Slice 3c; the oracle columns are schema-only until then.
+- [x] 8.5 Pull executor: build/**set nLockTime to current unix time**/sign/broadcast, idempotency guard
+  — **Slice 3a (token subs):** `PullExecutorService.buildPull`/`executePull` (exact output layout
+  `0 supportee, 1 service, 2 state, 3 funds` + BCH change tail), `nLockTime = now`, service-address
+  presence input, per-boundary idempotency (serialized per subscription + `pull` row written before
+  broadcast); broadcast via the CashScript `NetworkProvider.sendRawTransaction` (the same provider
+  the builder validates with — `ChainWatcher.broadcast` was removed as dead code). BCH/oracle pull
+  builder is Slice 3c.
+- [x] 8.6 Scheduler: due scan loop, buffer-warning trigger
+  — **Slice 3a:** `SchedulerService.scanDue`/`runOnce` (refresh → pull the `due` ones), buffer
+  warning (`escrow < bufferPercent × amount`), in-process concurrent-scan guard, interval loop
+  guarded by config (off in tests); `DiscoveryService` wired to `watcher.onChange` (Taiga #24)
+- [x] 8.7 REST API: subscriptions by party, detail (incl. arrears `n'`), notifications, auto-cancel
+  policy config — **authenticated** (party pkh proof), reads scoped to the caller
+  — **Slice 4:** `POST /auth/challenge` + `POST /auth/session` (Schnorr over
+  `sha256(challenge)`, pkh derived from the pubkey), `AuthGuard` (bearer token),
+  `GET /subscriptions` (+ `role`/`state` filters; channel/plan fail-closed until
+  Slice 6 links land), `GET /subscriptions/:id` (derived `n`/`m`/arrears/
+  futurePeriods + history), `GET /subscriptions/:id/notifications`,
+  `POST /subscriptions/:id/auto-cancel-policy` (supportee only; firing is Slice 5),
+  `GET /notifications`, `POST /webhooks` + `GET /webhooks` (endpoint registration,
+  party-scoped; secret returned once). `SubscriptionRepository.findByParty`
+  (pkh normalized on write + query); reads scoped to the caller pkh.
+  `api.module.ts` + `auth.module.ts`. **Slice 4 review fixes:** global
+  `RateLimitGuard` (in-memory sliding window, 429 + `Retry-After`); bad proof →
+  401 (malformed body stays 400); migration `down()` drops tables only;
+  idempotency key includes the payload digest; recursive `jsonSafe`; TTL eviction
+  on the challenge/session maps
+- [x] 8.8 Tests: cycle logic, idempotency, degradation paths, escrow-derivation parity with the contract
+  — **Slice 3a:** `pull-executor.test.ts` (exact layout + locktime, catch-up, underfunded,
+  modify propagation, idempotency, concurrency) + `scheduler.test.ts` (due pull, active skip,
+  paused, buffer warning, concurrent scan, 0-conf re-derive)
+  — **Slice 3a verification gaps:** VM-acceptance via `MockNetworkProvider.sendRawTransaction`
+  for boundary/catch-up/modify pulls (pins the output layout against the real covenant gates),
+  later-boundary re-broadcast (idempotency is per boundary, not permanent), and
+  `DiscoveryService.onModuleInit` → `watcher.onChange` → `derivedState.refresh` wiring test
+  (production path, not an inline re-implementation). Removed the dead `ChainWatcher.broadcast`
+  (executor broadcasts via the CashScript provider).
+- [x] 8.9 Auto-cancel policy (supportee opt-in): inactive-period threshold, pre-fire notification + grace window, top-up cancels the policy
+  — **Slice 5:** `AutoCancelService.scan` (fires after `thresholdPeriods` inactive periods + `graceSeconds`; emits `auto_cancel_warning` pre-fire; a top-up during grace disarms the policy; fires a `cancel` sweeping strays in the same tx). Wired into `SchedulerService.runScan`.
+- [x] 8.10 **Stray-value sweep** — include every stray UTXO (same-cat funds, foreign tokens/NFTs,
+  BCH) as an input to the cancel tx itself; `fund` absorbs same-cat strays; emit the stray-value notice
+  — **Slice 5:** `CancelExecutorService.buildCancel` classifies every covenant UTXO via `deriveEscrow`
+  and adds each stray as an input; refund folds stray funds, foreign tokens route to the supporter
+  (`tailOk`), the state NFT is burnt; emits `stray_value_notice` on broadcast. VM-accepted test proves
+  nothing remains at the address after the burn.
+- [x] 8.11 **Genesis validation** — on discovery, validate the genesis tx (one `mutable` state NFT,
   no `minting` NFT of the category, escrow ≥ `amount + seed`); refuse to track a sub that fails.
   Stays even after the factory ships (its guarantee is per-path)
+  — **Slice 2:** `validateGenesis` (libauth parse) + `DiscoveryService`; rejects `minting`/non-
+  `mutable`/multi state NFT, underfunded escrow, escrow locked off-covenant, unparseable commitment
+- [x] 8.12 **Platform authorization** — hold the service key; include a service-address presence
+  input in every tx the server authorizes (auto-cancel, scheduled cancel)
+  — **Slice 5:** `CancelExecutorService` reads the real service UTXO as the presence input (fails
+  loudly when the service address holds nothing); `cancel` authorizes via `isPresent(servicePkh)`.
+  Tests: presence input present; VM-accepted cancel with only the service presence.
+- [x] 8.13 **Notifications** — all event types (pull/fund/withdraw/reactivate success, paused,
+  config change, created/canceled, auto-cancel warning, stray-value); in-dapp + signed webhook with
+  retry/backoff + idempotency; persist to the notification log before delivery
+  — **Slice 4:** `NotificationService` (persist **before** delivery; in-dapp = the
+  log rows; HMAC-SHA256-signed webhook with `X-RecurrentPay-Signature` +
+  `X-RecurrentPay-Idempotency-Key`, at-least-once retry/backoff, injectable HTTP
+  transport), `NotificationRepository` (idempotency-key dedupe),
+  `WebhookEndpointRepository`, `notifications.module.ts` wired to
+  `SchedulerService.onEvent` (pull_success/paused/buffer_warning routed now; other
+  event types emit as their flows land — Slice 5+). Tests:
+  `notifications.test.ts` (persist-before-deliver, signed body, retry, dedupe,
+  attempts recorded, same-second distinct events, DB-level unique-key constraint),
+  `rate-limit.test.ts` (sliding window + 429), `migrations.test.ts` (up/down
+  round-trip)
+- [x] 8.14 **DB schema** — subscription, pull, notification, webhook_endpoint, auto_cancel_policy,
+  scheduled_cancel, oracle_message, account, channel, plan, subscription_link,
+  mutual_consent_proposal (migrations; derived values are caches)
+  — **Slice 1:** only the `subscription` table (derived-state cache) + migration tooling; remaining
+  tables land with their slices
+  — **Slice 3a:** `pull` table (`pull.entity.ts` + migration `1700000000001-create-pull.ts`)
+  — **Slice 3b:** `oracle_message` table + `subscription.oracle_pk_hash`/`oracle_pubkey`/`last_rate`
+  (migration `1700000000002-create-oracle-message.ts`)
+  — **Slice 4:** `notification`, `webhook_endpoint`, `auto_cancel_policy` tables
+  (migration `1700000000003-create-notification-webhook.ts`; entities registered in
+  data-source / database.module / run-migrations)
+  — **Slice 5:** `cancel` + `scheduled_cancel` tables (migration
+  `1700000000004-create-scheduled-cancel.ts`; entities registered in data-source /
+  database.module / run-migrations; up/down round-trip tested)
+- [ ] 8.15 **Off-chain channel/plan CRUD** — authenticated create/edit/hide for a creator's channel
+  and plans; plan data API for the wizard; write the subscription-link on creation
+- [x] 8.16 **Future-periods computation** — expose `floor(escrow / amount)` per subscription
+  — **Slice 1:** the pure computation + unit tests (API exposure in Slice 4)
+  — **Slice 4:** exposed as `futurePeriods` on `GET /subscriptions` and `GET /subscriptions/:id`
+- [ ] 8.17 **Mutual-consent relay** — store/notify a `modify`/`migrate` proposal, track signatures,
+  rebuild (never replay) at signing, broadcast on both-present; fee = initiator; expiry (24h) + revoke
+- [ ] 8.18 **Subscription filtering** — by channel / state / plan (basic; full matrix post-MVP)
+  — **Slice 4:** `state` and `role` filters land with the API (both tested);
+  `channel`/`plan` filters fail-closed until the `subscription_link` table lands
+  (Slice 6); README documents the fail-closed behavior
+- [ ] 8.19 **Judge demo seed** — mock channels/plans/subs (task, not a requirement)
 
 ### 9. Web app (Next.js)
 - [ ] 9.1 Scaffold Next.js + Tailwind; design system pass (impeccable: PRODUCT.md/DESIGN.md)

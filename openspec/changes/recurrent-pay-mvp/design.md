@@ -340,10 +340,12 @@ migrate-as-oracle-kill-switch) belong to the **oracle-coupling decision**, not t
 - **Stranded funds and foreign tokens are mitigable, not fraud vectors** — a stray funds UTXO is
   never counted as escrow (so it can never fake funding), but it *is* sweepable: `cancel` and
   `withdraw` refund it to the supporter, `fund` absorbs it into the escrow. A mis-sent token of
-  another category is similarly cleaned up to the supporter by any function (with the
-  state-category check ordered first, so the state NFT can never be routed out). Residual: funds
-  that never pass through a covenant tx are lost — hence the app warning and the txserver
-  consolidation path.
+  another category (fungible **or** NFT) is similarly cleaned up to the supporter by any function
+  (with the state-category check ordered first, so the state NFT can never be routed out — it is the
+  NFT being burned, so nothing is lost). The sweep is a **single transaction** the builder controls:
+  the covenant sees only its inputs and cannot require that strays be included. Residual: funds that
+  never pass through a covenant tx are lost — hence the txserver's include-all-strays cancel policy
+  (it watches the covenant address and sweeps whatever arrives, from any source).
 - **Migrate fairness is consent-based** — the token contract has no oracle, so it cannot verify
   the exchange rate of a re-denomination. The supportee's presence is the safeguard; the contract
   only enforces that the new escrow holds ≥ `carryOver` + seed. Settle-then-swap is the chosen order
@@ -393,20 +395,43 @@ Post-MVP on-chain options are recorded in `openspec/spec-ideas/cancel-scheduling
   confirmation. Smoother UX and the BCH norm; double-spend proofs are a post-MVP hardening step.
 - Cycle: detect due pull → (oracle subs) fetch oracle message → build pull tx → broadcast.
 - Postgres: subscriptions (derived state, next-payment cache, notification log).
-- Notifications: T−24h/in-buffer warning; pull success; pull fail (underfunded); config-change
-  to all parties; created/canceled. MVP in-dapp + webhook; email/Telegram = stretch.
+- Notifications: T−24h/in-buffer warning; pull success (periods settled); pull failure (underfunded,
+  oracle-degraded); **fund success**; **withdraw success**; **reactivate success** (waived periods,
+  fee); config-change to all parties; created/canceled; **auto-cancel warning**; **stray-value
+  notice**. MVP in-dapp + signed webhook (retry/backoff + idempotency); email/Telegram = stretch.
+  Persisted to the notification log before delivery.
+- **Platform authorization:** the txserver holds the platform **service key** (`servicePkh`) and
+  supplies a service-address presence input for every transaction it authorizes (auto-cancel,
+  scheduled cancel). Disclosed as the kill switch — the platform can unilaterally cancel a sub.
 - Re-reads NFT commitment each cycle → `modify`d terms propagate to the next pull automatically.
 - **Content gating is balance-based:** gate on `escrow ≥ payable`, not on `lastPeriodTime + period`
   — with catch-up, the clock is the last *settled* boundary, not the last *earned* one. Same
   computation the pull performs. **The txserver MUST derive `escrow` the same way the contract
   does** (co-created input, seed excluded) — if it sums all funds-category UTXOs, the
   false-funding fraud comes back through the content gate.
-- **Consolidation:** a periodic sweep that folds stray funds UTXOs (and foreign tokens) into the
-  covenant via `fund`/`withdraw`/`cancel`, so mis-sent value is not lost and cancel does not
-  strand it.
+- **Stray-value sweep is single-transaction:** the covenant is blind to the UTXO set, so the sweep
+  happens only if the tx builder includes the stray inputs. `cancel`/`withdraw` sweep same-category
+  strays and foreign tokens to the supporter; `fund` absorbs same-category strays into the escrow.
+  The txserver **includes every stray UTXO when it builds a cancel**, so no value is stranded by the
+  NFT burn — a builder-side policy, not a contract rule. The txserver watches the covenant address,
+  so it handles strays regardless of source. Residual footgun: a stray can still be stranded if the
+  server is down when the cancel fires.
 - **Genesis validation on discovery:** verify the genesis tx (one `mutable` state NFT, no `minting`
   NFT of the category, escrow ≥ `amount + seed`) before tracking a sub. Stays even after the factory
   ships — the factory's guarantee is per-path (a creator can bypass it).
+- **DB schema:** `subscription`, `pull`, `notification`, `webhook_endpoint`, `auto_cancel_policy`,
+  `scheduled_cancel`, `oracle_message`, plus the off-chain entities `account`, `channel`, `plan`,
+  `subscription_link`, `mutual_consent_proposal` — derived values are caches recomputed each cycle;
+  off-chain entities are metadata (see off-chain-data spec).
+- **Off-chain platform layer:** the txserver owns channel/plan CRUD (soft-delete only), the plan data
+  API, the plan → subscription link, `floor(escrow / amount)` future-periods, basic filtering, and
+  the **mutual-consent relay** for `modify`/`migrate`. The relay stores a proposal, notifies the
+  counterparty, and **rebuilds the tx at signing time** (never holds raw bytes — same rule as the
+  scheduled cancel); the initiator pays the fee, proposals expire (24h) and are revocable.
+- **nLockTime = current unix time** on every tx (the contract binds `tx.locktime`); **0-conf state is
+  provisional** — reorgs trigger re-derivation and notification reconciliation.
+- **API authenticated:** state-mutating and subscription-listing calls require proof of a party pkh;
+  reads are scoped to the caller.
 
 ## Web App
 

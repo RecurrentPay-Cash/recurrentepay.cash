@@ -67,7 +67,8 @@ Monorepo with **pnpm workspaces**. Node ≥ 20.10.
 |---|---|---|
 | Contracts | CashScript 0.14 (`cashc`), `@bitauth/libauth` | Present — token contract only |
 | Contract tests | Jest 29 + `ts-jest`, CashScript `MockNetworkProvider` | Present |
-| TxServer | NestJS, Postgres, Electrum/Fulcrum watcher | Planned |
+| Shared | TypeScript — commitment re-export, escrow/fee helpers, derived-state engine | Present |
+| TxServer | NestJS, Postgres (TypeORM), Electrum/Fulcrum watcher | **Slice 3a** (real Electrum/Fulcrum watcher, discovery + genesis validation, derived-state cache, token pull executor + scheduler, `/health`; no oracle/BCH pull, API or cancel paths yet) |
 | Web app | Next.js, Tailwind, WizardConnect | Planned |
 | Dev chain | chipnet (faucet: <https://chipnet.cash/>) | — |
 | Demo chain | mainnet (one verified pull required by the Mainnet Track) | — |
@@ -79,6 +80,16 @@ packages/contracts/          CashScript contracts + Jest suite
   contracts/token-subscription.cash
   src/commitment.ts          commitment codec + reference settlement arithmetic
   test/                      lifecycle, settle, transfers, scam, commitment
+packages/shared/             shared off-chain domain (re-exports the contract codec)
+  src/escrow.ts              escrow derivation (co-created input, seed excluded)
+  src/derived-state.ts       derived-state engine (n/m/payable/owedPreSettle/status)
+apps/txserver/               NestJS txserver — Slice 3a
+  src/watcher/               ChainWatcher interface + Electrum/Fulcrum client (mock for tests)
+  src/discovery/             genesis validation + subscription tracking + 0-conf re-derive
+  src/subscription/          derived-state cycle + cache repository
+  src/pull/                  token pull executor + `pull` repository
+  src/scheduler/             due scan → pull; buffer warning; config-guarded interval loop
+  src/db/                    TypeORM entities + migrations (`subscription`, `pull` tables)
 openspec/changes/recurrent-pay-mvp/
   proposal.md  design.md  tasks.md  specs/  design-changes-escrow-and-reactivate.md
 ```
@@ -90,7 +101,19 @@ pnpm install
 
 pnpm --filter contracts build   # compile the .cash contracts to artifacts/
 pnpm --filter contracts test    # Jest + MockNetworkProvider (slow; ~25 min)
+pnpm --filter shared test       # escrow / fee / derived-state parity tests (fast)
+
+pnpm --filter txserver test    # txserver tests (ephemeral SQLite — no Postgres needed)
+pnpm --filter txserver dev     # run the txserver (needs DATABASE_URL; CHAIN_WATCHER=mock to skip the node)
+pnpm --filter txserver migration:run   # create/refresh the `subscription` and `pull` tables
 ```
+
+The txserver is at **Slice 3a**: it watches the covenant address over a real Electrum/Fulcrum
+connection (0-conf), validates a subscription's genesis transaction before tracking it, derives
+subscription state and caches it in Postgres, **builds and broadcasts the token `pull`** for due
+subscriptions (with a service-presence input and per-boundary idempotency), runs a config-guarded
+due-pull scheduler, and serves `GET /health`. The BCH/oracle pull path, the REST API and the cancel
+paths are not implemented yet — see [`apps/txserver/README.md`](apps/txserver/README.md).
 
 Run a single test while developing — it is orders of magnitude faster than the full suite:
 
