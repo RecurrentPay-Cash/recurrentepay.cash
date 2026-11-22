@@ -1,0 +1,46 @@
+import { DataSource, type DataSourceOptions } from 'typeorm';
+import { Subscription } from './subscription.entity.js';
+import { Pull } from './pull.entity.js';
+import { OracleMessage } from './oracle-message.entity.js';
+import { Notification } from './notification.entity.js';
+import { WebhookEndpoint } from './webhook-endpoint.entity.js';
+import { AutoCancelPolicy } from './auto-cancel-policy.entity.js';
+import { Cancel } from './cancel.entity.js';
+import { ScheduledCancel } from './scheduled-cancel.entity.js';
+
+/**
+ * Build the TypeORM data source options.
+ *
+ * `synchronize` is off: the schema is owned by migrations (see
+ * `src/db/migrations/`). Tests may pass `synchronize: true` for an ephemeral DB.
+ */
+export function buildDataSourceOptions(
+  databaseUrl: string,
+  overrides: Partial<DataSourceOptions> = {},
+): DataSourceOptions {
+  return {
+    type: 'postgres',
+    url: databaseUrl,
+    entities: [
+      Subscription,
+      Pull,
+      OracleMessage,
+      Notification,
+      WebhookEndpoint,
+      AutoCancelPolicy,
+      Cancel,
+      ScheduledCancel,
+    ],
+    migrations: [],
+    synchronize: false,
+    ...overrides,
+  } as DataSourceOptions;
+}
+
+/** Create a data source from a connection string. */
+export function createDataSource(
+  databaseUrl: string,
+  overrides: Partial<DataSourceOptions> = {},
+): DataSource {
+  return new DataSource(buildDataSourceOptions(databaseUrl, overrides));
+}
