@@ -1,7 +1,12 @@
 # subscription-contract Specification
 
 ## Purpose
-TBD - created by archiving change oracle-subscription-covenant. Update Purpose after archive.
+The on-chain subscription state machines for RecurrentPay.Cash: two CashScript covenants
+(`token-subscription` for CashToken payments, `oracle-subscription` for BCH payments via an
+oracles.cash price feed) sharing one `gate → settle → delta` state machine (`pull`, `cancel`,
+`modify`, `setPkh`, `migrate`, `fund`, `withdraw`, `reactivate`). These requirements define the
+escrow/seed (token) and single-UTXO/DUST (oracle) accounting, the m-period catch-up settlement, and
+the service rules the txserver and web app build against.
 
 ## Requirements
 

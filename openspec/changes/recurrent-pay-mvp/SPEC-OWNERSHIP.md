@@ -37,6 +37,21 @@ low-churn, so manual reconciliation is cheap.
   *Retry/dunning*, *Shareable links*, *Documentation* (18 requirements vs. 8).
 - **`specs/off-chain-data/spec.md`** — exists only in the dapp worktree.
 
+## Archived txserver domain (intentional duplication)
+
+The txserver domain was archived separately on **2026-11-22** — see
+`openspec/changes/archive/2026-11-22-txserver-mvp/`. Its requirements were merged into the living
+spec `openspec/specs/txserver/spec.md`, which is now the **archived authority** for the txserver.
+
+This change **keeps** its `specs/txserver/spec.md` delta copy on purpose: the `dapp` worktree still
+needs it to reconcile the umbrella change at merge time, and deleting it would break
+`recurrent-pay-mvp` for the web-app/platform streams. The two copies are byte-identical apart from
+the synced header (`# txserver Specification` / `## Purpose` vs. `# TxServer — Requirements` /
+`## ADDED Requirements`; the archive drops the non-requirement `## Test Requirements` tail).
+
+Do **not** re-archive the whole `recurrent-pay-mvp` change from this worktree — its web-app,
+platform, and subscription-contract requirements are still open.
+
 ## Sync checklist (run before merging the worktrees)
 
 - [ ] Copy `specs/txserver/spec.md` from the txserver worktree into the merge target.
