@@ -8,9 +8,15 @@
  * unauthenticated `POST /auth/*` — is throttled (Slice 4 review MAJOR 1, spec
  * § Notifications — "rate-limited off-chain"). The limit is injectable via
  * `RATE_LIMITER_OPTIONS` so tests can tune it.
+ *
+ * `ChainWatcherModule` is imported so `ChallengeService` can select a spendable
+ * UTXO for the signed-challenge **transaction** path (handoff §2). The watcher
+ * is `@Optional()` in the service, so the message-signature path still works
+ * without it.
  */
 import { Module } from '@nestjs/common';
 import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
+import { ChainWatcherModule } from '../watcher/chain-watcher.module.js';
 import { ChallengeService } from './challenge.service.js';
 import { SessionService } from './session.service.js';
 import { AuthGuard } from './auth.guard.js';
@@ -18,6 +24,7 @@ import { RateLimiter, RATE_LIMITER_OPTIONS, DEFAULT_RATE_LIMIT } from './rate-li
 import { RateLimitGuard } from './rate-limit.guard.js';
 
 @Module({
+  imports: [ChainWatcherModule],
   providers: [
     ChallengeService,
     SessionService,

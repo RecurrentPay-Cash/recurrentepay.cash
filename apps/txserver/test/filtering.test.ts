@@ -36,6 +36,7 @@ import { AuthController } from '../src/api/auth.controller.js';
 import { SubscriptionsController } from '../src/api/subscriptions.controller.js';
 import { DiscoveryService } from '../src/discovery/discovery.service.js';
 import { OracleActionsService } from '../src/pull/oracle-actions.service.js';
+import { TokenActionsService } from '../src/pull/token-actions.service.js';
 import { NotificationsController } from '../src/api/notifications.controller.js';
 import { WebhooksController } from '../src/api/webhooks.controller.js';
 import { AutoCancelPolicyRepository } from '../src/api/auto-cancel-policy.repository.js';
@@ -159,6 +160,7 @@ describe('Subscription filtering (channel / state / plan)', () => {
         { provide: AuthGuard, useValue: guard },
         { provide: DiscoveryService, useValue: { discover: async () => ({ tracked: false, reason: "test" }) } },
         { provide: OracleActionsService, useValue: {} },
+        { provide: TokenActionsService, useValue: {} },
       ],
     }).compile();
 

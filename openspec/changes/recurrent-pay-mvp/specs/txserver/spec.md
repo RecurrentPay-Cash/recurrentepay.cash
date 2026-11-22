@@ -477,6 +477,16 @@ auto-cancel policy, read notifications) SHALL be **authenticated**: the caller p
 party pkh (wallet signature over a server-issued challenge, or a session issued after WizardConnect
 connection). Read endpoints SHALL be scoped to the authenticated pkh.
 
+The caller SHALL be able to prove control of a party pkh by **either** of two alternate proofs:
+
+1. **Message signature** — the wallet signs `sha256(utf8(challenge))` with Schnorr and returns
+   `(pubkey, signature, challenge)`.
+2. **Signed transaction** — the server builds a challenge **transaction** spending a UTXO owned by
+   the claimed pkh (carrying the challenge nonce in an `OP_RETURN`); the wallet signs input 0 with
+   `SIGHASH_ALL | FORKID | UTXOS` and returns the signed tx. The tx is **never broadcast** — it is
+   only proof of key control. This path exists because WizardConnect signs transactions, not
+   messages.
+
 #### Scenario: Dashboard query
 - **GIVEN** a connected wallet (pkh)
 - **WHEN** the web app requests its subscriptions
@@ -487,6 +497,21 @@ connection). Read endpoints SHALL be scoped to the authenticated pkh.
   party's pkh
 - **WHEN** the API receives it
 - **THEN** the request is rejected (401/403) and no schedule/policy is recorded
+
+#### Scenario: Signed-challenge transaction proof
+- **GIVEN** a wallet that can sign transactions but not messages (WizardConnect)
+- **WHEN** it requests `POST /auth/challenge` with its pkh and a list of its addresses
+- **THEN** the server returns an unsigned challenge tx spending a spendable UTXO at one of those
+  addresses, with the nonce in an `OP_RETURN`, plus `sourceOutputs` and the chosen `addressIndex`
+- **AND** when the wallet returns the signed tx to `POST /auth/session`, the server verifies the
+  signature over the BCH signing serialization, that the tx spends the same UTXO, that the nonce is
+  unchanged, and that `hash160(pubkey) === pkh`
+- **AND** on success the server issues a session token
+
+#### Scenario: No spendable UTXO for the challenge tx
+- **GIVEN** a pkh with no spendable UTXO at any of the offered addresses
+- **WHEN** it requests a challenge transaction
+- **THEN** the server responds `409` with code `no-spendable-utxo`
 
 ### Requirement: Postgres schema (derived state)
 The txserver SHALL persist derived state in Postgres. The schema SHALL include at least:

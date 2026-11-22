@@ -380,6 +380,22 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
   (`src/offchain/seed-demo.ts`); creates a mock channel + plans, **idempotent**
   (keys on channel/plan title). Tests: `demo-seed.test.ts` (creates, running twice does not
   duplicate).
+- [x] 8.20 **Token-path `fund` / `withdraw` / `reactivate` prepare + broadcast** — so the web app
+  needs **no Fulcrum/node of its own**: it reads state / gets an unsigned tx from the server, signs
+  client-side, and the server broadcasts. Mirrors `OracleActionsService`'s no-key model (the token
+  covenant authorizes by **presence**, no oracle message): `prepare` builds against the current
+  outpoints with correctly-sized P2PKH **placeholders** and returns `{ unsignedHex, signableInputs }`
+  (never broadcasts); `broadcast` verifies the client-signed hex spends the covenant's current
+  state (and co-created escrow) outpoint, then relays. The server signs only its own service-key fee
+  input; it never holds a party key. `withdraw` (settle → reclaim `escrow − gross − retained` +
+  same-cat strays), `reactivate` (paused-only, `newFunds ≥ amountNext`, promotes terms, advances by
+  `n·period`), `fund` (permissionless top-up, state unchanged). Routes: `POST
+  /subscriptions/:id/{withdraw-token,reactivate-token,fund-token}/prepare|broadcast`
+  (supporter-only for withdraw/reactivate; any party for fund; non-party → 404). Tests:
+  `token-actions.test.ts` (exact layout + VM-acceptance against the real token artifact for all
+  three via the client-signer, gross=0 branch, stray fold, paused gate, funding gate, oracle-sub
+  refusal, broadcast rejects unsigned/tampered + non-current outpoint), `token-actions-api.test.ts`
+  (401/404, prepare-doesn't-broadcast, broadcast relays, `privateKey` stripped).
 
 ### 9. Web app (Next.js)
 - [ ] 9.1 Scaffold Next.js + Tailwind; design system pass (impeccable: PRODUCT.md/DESIGN.md)

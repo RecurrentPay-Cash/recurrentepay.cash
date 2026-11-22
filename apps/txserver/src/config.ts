@@ -24,6 +24,13 @@ export interface AppConfig {
   proposalExpirySeconds: number;
   /** HTTP port. */
   port: number;
+  /**
+   * CORS allow-list (browser origins that may call the txserver directly, e.g.
+   * the Next.js web app). Empty in production means "deny all cross-origin
+   * requests" — the browser is the only client that needs CORS, and bearer
+   * auth means no credentials are involved. Dev defaults to the local web app.
+   */
+  corsOrigins: string[];
 }
 
 const DEFAULTS = {
@@ -34,6 +41,9 @@ const DEFAULTS = {
   // Spec § Mutual-consent relay — a proposal expires after 24h by default.
   proposalExpirySeconds: 24 * 60 * 60,
   port: 3001,
+  // Dev default: the local Next.js web app. Production sets CORS_ORIGINS
+  // explicitly (an empty value there denies all cross-origin requests).
+  corsOrigins: ['http://localhost:3000'],
 } as const;
 
 /** Parse and validate the environment. Throws on missing/invalid required vars. */
@@ -72,5 +82,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     bufferPercent,
     proposalExpirySeconds,
     port,
+    corsOrigins: parseCorsOrigins(env.CORS_ORIGINS),
   };
+}
+
+/**
+ * Parse the comma-separated `CORS_ORIGINS` allow-list.
+ *
+ * - Unset → the dev default (`http://localhost:3000`).
+ * - Set to an empty/whitespace string → `[]` (deny all cross-origin requests).
+ * - Otherwise → the trimmed, non-empty entries.
+ */
+function parseCorsOrigins(raw: string | undefined): string[] {
+  if (raw === undefined) return [...DEFAULTS.corsOrigins];
+  return raw
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter((origin) => origin !== '');
 }

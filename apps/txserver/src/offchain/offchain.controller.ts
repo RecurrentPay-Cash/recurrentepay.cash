@@ -31,6 +31,7 @@ import {
   OffchainService,
   type ChannelView,
   type PlanView,
+  type PublicChannelSummary,
 } from './offchain.service.js';
 import type { ChannelUpsert } from './channel.repository.js';
 import type { PlanUpsert } from './plan.repository.js';
@@ -61,6 +62,22 @@ export class OffchainController {
     const parsed = parseId(channelId);
     if (parsed === undefined) return [];
     return this.offchain.visiblePlans(parsed);
+  }
+
+  /**
+   * Public channel read by id (dapp-handoff §4): the channel + its **visible**
+   * plans. No auth — channel/plan pages are public discovery metadata. Unknown
+   * or hidden channel → 404.
+   */
+  @Get('channels/:id')
+  async publicChannel(@Param('id', ParseIntPipe) id: number): Promise<ChannelView> {
+    return this.offchain.publicChannel(id);
+  }
+
+  /** Public channel list for the picker (dapp-handoff §4). No auth. */
+  @Get('channels')
+  async publicChannels(): Promise<PublicChannelSummary[]> {
+    return this.offchain.publicChannels();
   }
 
   /** The caller's channel (with its visible plans), or `null`. */

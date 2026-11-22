@@ -34,10 +34,22 @@ export interface PlanView {
   amount: string;
   period: number;
   asset: string;
+  unit: string | null;
   benefits: string[] | null;
   defaultMode: number;
   visible: boolean;
 }
+
+/** A channel as the public picker exposes it (no owner/plan detail). */
+export interface PublicChannelSummary {
+  id: number;
+  title: string;
+  cover: string | null;
+  description: string | null;
+}
+
+/** The allowed display denominations for a plan's `unit` (dapp-handoff §7). */
+export const PLAN_UNITS = ['BCH', 'PUSD', 'MUSD', 'USD', 'XAU'] as const;
 
 /**
  * Off-chain platform service (spec § Off-chain channel and plan management).
@@ -123,6 +135,7 @@ export class OffchainService {
       amount: requireAmount(body.amount),
       period: requirePeriod(body.period),
       asset: body.asset ?? 'BCH',
+      unit: requireUnit(body.unit),
       benefits: body.benefits ?? null,
       defaultMode: normalizeMode(body.defaultMode ?? channel.defaultMode),
     });
@@ -138,6 +151,7 @@ export class OffchainService {
     if (body.amount !== undefined) patch.amount = requireAmount(body.amount);
     if (body.period !== undefined) patch.period = requirePeriod(body.period);
     if (body.asset !== undefined) patch.asset = body.asset;
+    if (body.unit !== undefined) patch.unit = requireUnit(body.unit);
     if (body.benefits !== undefined) patch.benefits = body.benefits;
     if (body.defaultMode !== undefined) patch.defaultMode = normalizeMode(body.defaultMode);
     const updated = await this.plans.update(plan.id, patch);
@@ -169,6 +183,30 @@ export class OffchainService {
         ? await this.plans.findAllVisible()
         : await this.plans.findVisibleByChannel(channelId);
     return rows.map(toPlanView);
+  }
+
+  /**
+   * Public channel read by id (dapp-handoff §4): the channel plus its **visible**
+   * plans. Unknown or hidden channel → `404`. No auth: it exposes only discovery
+   * metadata (never a party's subscriptions), so it is safe to serve publicly.
+   */
+  async publicChannel(channelId: number): Promise<ChannelView> {
+    const channel = await this.channels.findById(channelId);
+    if (channel === null) throw new NotFoundException('channel not found');
+    return this.toChannelView(channel);
+  }
+
+  /** Public channel list for the picker (dapp-handoff §4): id/title/cover/description. */
+  async publicChannels(): Promise<PublicChannelSummary[]> {
+    const rows = await this.channels.findAll();
+    return rows
+      .map((channel) => ({
+        id: channel.id,
+        title: channel.title,
+        cover: channel.cover,
+        description: channel.description,
+      }))
+      .sort((a, b) => a.id - b.id);
   }
 
   /** Resolve a plan for the wizard, regardless of visibility (hidden resolves). */
@@ -300,6 +338,7 @@ export function toPlanView(plan: Plan): PlanView {
     amount: plan.amount,
     period: plan.period,
     asset: plan.asset,
+    unit: plan.unit,
     benefits: plan.benefits,
     defaultMode: plan.defaultMode,
     visible: plan.visible,
@@ -340,4 +379,16 @@ function requirePeriod(value: unknown): number {
     throw new BadRequestException('period must be a positive integer');
   }
   return period;
+}
+
+/**
+ * Validate a plan's display `unit` against the allowed set (dapp-handoff §7).
+ * `undefined`/`null`/`''` → `null` (unset); an unknown unit is a 400.
+ */
+function requireUnit(value: unknown): string | null {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value !== 'string' || !(PLAN_UNITS as readonly string[]).includes(value)) {
+    throw new BadRequestException(`unit must be one of ${PLAN_UNITS.join(', ')}`);
+  }
+  return value;
 }

@@ -17,6 +17,10 @@ import oracleArtifact from 'contracts/artifacts/oracle-subscription.artifact.js'
 import { CHAIN_WATCHER, type ChainWatcher } from '../watcher/chain-watcher.js';
 import { SubscriptionRepository } from '../subscription/subscription.repository.js';
 import { DerivedStateService, type WatchedSubscription } from '../subscription/derived-state.service.js';
+import {
+  TransitionDetector,
+  type PreviousState,
+} from '../subscription/transition-detector.js';
 import { NotificationService } from '../notifications/notification.service.js';
 import { validateGenesis } from './genesis-validation.js';
 
@@ -50,6 +54,7 @@ export class DiscoveryService implements OnModuleInit {
     private readonly repository: SubscriptionRepository,
     private readonly derivedState?: DerivedStateService,
     @Optional() private readonly notifications?: NotificationService,
+    @Optional() private readonly transitions?: TransitionDetector,
   ) {}
 
   /**
@@ -83,8 +88,72 @@ export class DiscoveryService implements OnModuleInit {
         stateCategory: row.stateCategory,
         fundsCategory: row.fundsCategory,
         covenantAddress: address,
+        assetType: row.assetType,
+        oraclePubkey: row.oraclePubkey,
       };
-      await this.derivedState.refresh(sub, now);
+      // Capture the row **before** the refresh so the transition detector can diff
+      // the previous derived state against the newly derived one (spec
+      // § Notifications items d/e/f — fund/withdraw/reactivate success).
+      const previous: PreviousState = {
+        status: row.status,
+        escrowBalance: BigInt(row.escrowBalance),
+        lastPeriodTime: row.lastPeriodTime,
+        amount: BigInt(row.amount),
+        amountNext: BigInt(row.amountNext),
+      };
+      const result = await this.derivedState.refresh(sub, now);
+      await this.emitTransition(row.stateCategory, previous, result.row);
+    }
+  }
+
+  /**
+   * Detect and emit a `fund_success` / `withdraw_success` / `reactivate_success`
+   * notification for a 0-conf change (spec § Notifications items d/e/f).
+   *
+   * Classification is by the spending tx's outputs (see `TransitionDetector`); a
+   * plain pull (or any other transition) emits nothing — `pull_success` already
+   * comes from the scheduler. Idempotent: `NotificationService.emit` dedupes on the
+   * idempotency key, so re-deriving the same change never double-emits.
+   *
+   * Best-effort: a detector/emit failure is logged and swallowed so it can never
+   * break the derived-state refresh.
+   */
+  private async emitTransition(
+    stateCategory: string,
+    previous: PreviousState,
+    fresh: { supporterPkh: string; supporteePkh: string; servicePkh: string },
+  ): Promise<void> {
+    if (this.transitions === undefined || this.notifications === undefined) return;
+    try {
+      const row = await this.repository.findById(stateCategory);
+      if (row === null) return;
+      const utxos = await this.watcher.getUtxos(row.covenantAddress());
+      const transition = await this.transitions.detect(
+        {
+          stateCategory,
+          fundsCategory: row.fundsCategory,
+          covenantAddress: row.covenantAddress(),
+        },
+        previous,
+        utxos,
+      );
+      if (transition === null) return;
+      const recipients = [fresh.supporterPkh, fresh.supporteePkh, fresh.servicePkh].map((p) =>
+        p.toLowerCase(),
+      );
+      await this.notifications.emit(
+        {
+          type: transition.type,
+          subscriptionId: stateCategory,
+          at: Math.floor(Date.now() / 1000),
+          data: transition.data,
+        },
+        { recipients },
+      );
+    } catch (error) {
+      this.logger.warn(
+        `transition notification failed for ${stateCategory}: ${(error as Error).message}`,
+      );
     }
   }
 

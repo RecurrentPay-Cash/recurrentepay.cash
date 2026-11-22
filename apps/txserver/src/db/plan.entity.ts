@@ -43,6 +43,15 @@ export class Plan {
   @Column({ name: 'asset', type: 'text', default: 'BCH' })
   asset!: string;
 
+  /**
+   * Display denomination for the plan amount (`BCH` | `PUSD` | `MUSD` | `USD` |
+   * `XAU`), or `null` when unset. `asset` is the coarse on-chain family
+   * (BCH/token); `unit` is what the web renders. `amount` stays an integer
+   * string in the plan's minor unit — this column never changes its semantics.
+   */
+  @Column({ name: 'unit', type: 'text', nullable: true })
+  unit!: string | null;
+
   /** Benefits (JSON array of strings) — metadata, never on-chain. */
   @Column({ name: 'benefits', type: 'simple-json', nullable: true })
   benefits!: string[] | null;

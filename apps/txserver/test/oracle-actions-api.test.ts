@@ -41,6 +41,7 @@ import { SubscriptionRepository } from '../src/subscription/subscription.reposit
 import { OracleMessageRepository } from '../src/oracle/oracle-message.repository.js';
 import { OracleClientService, type OracleHttpClient } from '../src/oracle/oracle-client.service.js';
 import { OracleActionsService } from '../src/pull/oracle-actions.service.js';
+import { TokenActionsService } from '../src/pull/token-actions.service.js';
 import { SubscriptionsController } from '../src/api/subscriptions.controller.js';
 import { AuthController } from '../src/api/auth.controller.js';
 import { ChallengeService } from '../src/auth/challenge.service.js';
@@ -314,6 +315,9 @@ describe('Oracle actions API', () => {
         { provide: SessionService, useValue: sessions },
         { provide: AuthGuard, useValue: guard },
         { provide: OracleActionsService, useValue: oracleActions },
+        // The token routes are exercised in `token-actions-api.test.ts`; this
+        // suite only needs the oracle routes, so the token service is a stub.
+        { provide: TokenActionsService, useValue: {} },
         {
           provide: DiscoveryService,
           useValue: { discover: async () => ({ tracked: false, reason: 'test' }) },

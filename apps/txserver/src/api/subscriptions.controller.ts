@@ -32,6 +32,7 @@ import { ScheduledCancelService } from '../cancel/scheduled-cancel.service.js';
 import { OffchainService } from '../offchain/offchain.service.js';
 import { DiscoveryService } from '../discovery/discovery.service.js';
 import { OracleActionsService } from '../pull/oracle-actions.service.js';
+import { TokenActionsService } from '../pull/token-actions.service.js';
 import { parseId } from './query-id.js';
 
 /** Filtering query (§ Subscription filtering — basic). */
@@ -58,6 +59,7 @@ export class SubscriptionsController {
     private readonly offchain: OffchainService,
     private readonly discovery: DiscoveryService,
     private readonly oracleActions: OracleActionsService,
+    private readonly tokenActions: TokenActionsService,
   ) {}
 
   /** The caller's subscriptions, with derived fields and basic filtering. */
@@ -384,6 +386,155 @@ export class SubscriptionsController {
     };
   }
 
+  // ---------------------------------------------------------------------------
+  // Token-path actions: fund / withdraw / reactivate (no oracle, no party key).
+  //
+  // These mirror the oracle routes but operate on the **token** covenant (two
+  // UTXOs: state NFT + co-created escrow). The server builds the tx against the
+  // current outpoints with unsigned P2PKH placeholders, returns the hex + the
+  // inputs the client must sign, and relays the client-signed tx. It holds no
+  // party key. `withdraw`/`reactivate` are supporter-only; `fund` is
+  // permissionless (any party to the sub may top it up).
+  // ---------------------------------------------------------------------------
+
+  /** Prepare a token **withdraw** (supporter only). Returns unsigned hex + signable inputs. */
+  @Post(':stateCategory/withdraw-token/prepare')
+  async prepareTokenWithdraw(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { supporterInput?: RawOracleInput; strayInputs?: RawTokenInput[] },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireSupporter(stateCategory, pkh);
+    const built = await this.tokenActions.buildTokenWithdraw(row, {
+      now: Math.floor(Date.now() / 1000),
+      supporterInput: parseOracleInput(body?.supporterInput),
+      strayInputs: parseTokenInputs(body?.strayInputs),
+    });
+    return {
+      stateCategory,
+      unsignedHex: built.hex,
+      signableInputs: built.signableInputs,
+      gross: built.gross.toString(),
+      fee: built.fee.toString(),
+      payout: built.payout.toString(),
+      retained: built.retained.toString(),
+    };
+  }
+
+  /** Relay a **client-signed** token withdraw (verified + broadcast). */
+  @Post(':stateCategory/withdraw-token/broadcast')
+  async broadcastTokenWithdraw(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { signedHex?: string },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireSupporter(stateCategory, pkh);
+    if (typeof body?.signedHex !== 'string' || body.signedHex === '') {
+      throw new BadRequestException('signedHex is required');
+    }
+    const { txid } = await this.tokenActions.broadcastTokenWithdraw(
+      row,
+      body.signedHex,
+      Math.floor(Date.now() / 1000),
+    );
+    return { stateCategory, txid };
+  }
+
+  /** Prepare a token **reactivate** (supporter only, paused-only). */
+  @Post(':stateCategory/reactivate-token/prepare')
+  async prepareTokenReactivate(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { fundingInputs?: RawTokenInput[] },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireSupporter(stateCategory, pkh);
+    const fundingInputs = parseTokenInputs(body?.fundingInputs);
+    if (fundingInputs.length === 0) {
+      throw new BadRequestException('at least one fundingInput is required');
+    }
+    const built = await this.tokenActions.buildTokenReactivate(row, {
+      now: Math.floor(Date.now() / 1000),
+      fundingInputs,
+    });
+    return {
+      stateCategory,
+      unsignedHex: built.hex,
+      signableInputs: built.signableInputs,
+      supporteeAmount: built.supporteeAmount.toString(),
+      fee: built.fee.toString(),
+      newFunds: built.newFunds.toString(),
+    };
+  }
+
+  /** Relay a **client-signed** token reactivate (verified + broadcast). */
+  @Post(':stateCategory/reactivate-token/broadcast')
+  async broadcastTokenReactivate(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { signedHex?: string },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireSupporter(stateCategory, pkh);
+    if (typeof body?.signedHex !== 'string' || body.signedHex === '') {
+      throw new BadRequestException('signedHex is required');
+    }
+    const { txid } = await this.tokenActions.broadcastTokenReactivate(
+      row,
+      body.signedHex,
+      Math.floor(Date.now() / 1000),
+    );
+    return { stateCategory, txid };
+  }
+
+  /** Prepare a token **fund** (permissionless top-up; any party). */
+  @Post(':stateCategory/fund-token/prepare')
+  async prepareTokenFund(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { funderInput?: RawTokenInput; strayInputs?: RawTokenInput[] },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireParty(stateCategory, pkh);
+    const funderInput = parseTokenInputs([body?.funderInput as RawTokenInput])[0];
+    if (funderInput === undefined) {
+      throw new BadRequestException('a funderInput is required');
+    }
+    const built = await this.tokenActions.buildTokenFund(row, {
+      now: Math.floor(Date.now() / 1000),
+      funderInput,
+      strayInputs: parseTokenInputs(body?.strayInputs),
+    });
+    return {
+      stateCategory,
+      unsignedHex: built.hex,
+      signableInputs: built.signableInputs,
+      total: built.total.toString(),
+    };
+  }
+
+  /** Relay a **client-signed** token fund (verified + broadcast). */
+  @Post(':stateCategory/fund-token/broadcast')
+  async broadcastTokenFund(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { signedHex?: string },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireParty(stateCategory, pkh);
+    if (typeof body?.signedHex !== 'string' || body.signedHex === '') {
+      throw new BadRequestException('signedHex is required');
+    }
+    const { txid } = await this.tokenActions.broadcastTokenFund(
+      row,
+      body.signedHex,
+      Math.floor(Date.now() / 1000),
+    );
+    return { stateCategory, txid };
+  }
+
   /**
    * Track a subscription from its genesis transaction (the creation webhook).
    *
@@ -483,6 +634,43 @@ function parseOracleInput(raw: RawOracleInput | undefined): {
     satoshis: BigInt(raw.satoshis),
     lockingBytecode: raw.lockingBytecode.toLowerCase(),
   };
+}
+
+/** A raw token input supplied by the client (a funds-category UTXO; no key). */
+interface RawTokenInput {
+  txid?: string;
+  vout?: number;
+  satoshis?: string;
+  lockingBytecode?: string;
+  category?: string;
+  amount?: string;
+}
+
+/** Validate + normalise a caller-supplied token input (whitelist; drops extras). */
+function parseTokenInputs(raw: RawTokenInput[] | undefined): Array<{
+  txid: string;
+  vout: number;
+  satoshis: bigint;
+  lockingBytecode: string;
+  category: string;
+  amount: bigint;
+}> {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((entry) => {
+    const base = parseOracleInput(entry);
+    if (base === undefined) throw new BadRequestException('token input is required');
+    if (typeof entry.category !== 'string' || !/^[0-9a-f]{64}$/i.test(entry.category)) {
+      throw new BadRequestException('token input category must be a 32-byte category hex');
+    }
+    if (typeof entry.amount !== 'string' || !/^\d+$/.test(entry.amount)) {
+      throw new BadRequestException('token input amount must be a decimal string');
+    }
+    return {
+      ...base,
+      category: entry.category.toLowerCase(),
+      amount: BigInt(entry.amount),
+    };
+  });
 }
 
 /** The API view of a subscription: stored cache + clock-derived fields. */
