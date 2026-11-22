@@ -49,10 +49,60 @@ store.
 | `GET` | `/notifications` | The caller's notifications across their subs |
 | `POST` | `/webhooks` | Register a webhook endpoint for the caller (returns the secret once) |
 | `GET` | `/webhooks` | The caller's registered endpoints (secret never echoed) |
+| `GET` | `/offchain/plan-data` | **Public** plan data API: visible plans (seeds the create wizard) |
+| `GET` | `/offchain/channel` | The caller's channel + its visible plans (`null` if none) |
+| `POST` | `/offchain/channel` | Create the caller's channel (one per creator for MVP) |
+| `PUT` | `/offchain/channel` | Edit the caller's channel |
+| `GET` | `/offchain/plans` | The caller's visible plans |
+| `POST` | `/offchain/plans` | Add a plan to the caller's channel |
+| `PUT` | `/offchain/plans/:id` | Edit a plan on the caller's channel |
+| `DELETE` | `/offchain/plans/:id` | **Hide** a plan (soft-delete; never hard-deleted) |
+| `POST` | `/offchain/subscriptions/:subscriptionId/link` | Link a subscription the caller is a party to, to one of the caller's plans (`{ planId }`) |
 
-**`channel`/`plan` filters fail closed**: until the off-chain `subscription_link` table lands
-(Slice 6), filtering by either returns `[]` rather than leaking every subscription. `role` and
-`state` are fully functional.
+**`channel`/`plan` filters join through `subscription_link`** (Slice 6): filtering by a channel or
+plan returns only the linked subs; an unknown channel/plan yields `[]` (fail-closed, never
+"return everything"). `channel` and `plan` combine with **AND** (`?channel=1&plan=2` → subs in
+channel 1 *and* on plan 2). `role` and `state` remain fully functional.
+
+`GET /offchain/plan-data?channelId=…` fails closed too: a present but invalid `channelId`
+(`abc`, `-1`, `1e3`) returns `[]`, not the global feed.
+
+## Off-chain platform layer (Slice 6)
+
+The txserver owns the off-chain metadata the covenant knows nothing about: a creator's **channel**
+and its **plans**, the **plan data API** for the create wizard, and the **plan → subscription
+link**. None of it is authoritative — the chain remains the source of truth for a sub's terms and
+status; off-chain writes never alter a live sub's on-chain terms.
+
+- **Channel/plan CRUD** — authenticated (`/offchain/*`); the caller pkh resolves to a creator
+  account (created lazily; one channel per creator for MVP). A creator can only read/edit their own
+  channel and plans (another creator's plan is a 403).
+- **Soft-delete only** — `DELETE /offchain/plans/:id` sets `visible = false`. The plan leaves
+  discovery but linked subscriptions stay valid; there is deliberately no hard-delete. A hard delete
+  would orphan live subs.
+- **Plan data API** — `GET /offchain/plan-data` (public) exposes visible plans so the wizard can
+  seed itself. A hidden plan still resolves by id (a sub created from it stays valid).
+- **Plan → subscription link** — written via `POST /offchain/subscriptions/:subscriptionId/link`
+  (authenticated; the caller must be a party to the sub and own the plan's channel) or
+  `OffchainService.linkSubscription`, keyed on the state-NFT category. The web app calls it after a
+  creation that carries a `planId`; the supporter's account is recorded from the caller's pkh. It is
+  the join the `channel`/`plan` subscription filters read.
+- **Account identity** — keyed on the creator **pkh** (unique column), resolved lazily on first use.
+  Ownership is the exact pkh, never a derived hash, so two creators can never alias onto one account.
+
+### Demo seed
+
+```bash
+pnpm --filter txserver seed:demo   # requires DATABASE_URL (Postgres)
+```
+
+Creates a mock creator channel + plans so the judge demo has data. **Idempotent** — running it
+twice does not duplicate (it keys on the channel title and the plan title within the channel).
+
+Both `seed:demo` and `migration:run` run through **`tsx`** (a dev dependency), which resolves the
+NodeNext `.js` import specifiers in the TS sources. Plain `node --experimental-strip-types` cannot
+resolve those `.js` specifiers, so the scripts would fail with `ERR_MODULE_NOT_FOUND` under a pinned
+Node 26 — `tsx` is the fix.
 
 ## Cancel paths (Slice 5)
 
@@ -100,3 +150,5 @@ TypeORM migrations (`pnpm --filter txserver migration:run`).
 - Slice 4: `notification`, `webhook_endpoint`, `auto_cancel_policy` (`1700000000003`).
 - Slice 5: `cancel` + `scheduled_cancel` (`1700000000004`); `auto_cancel_policy.warned_at` for the
   once-per-grace-window warning dedupe (`1700000000005`).
+- Slice 6: `account`, `channel`, `plan`, `subscription_link` (`1700000000006`) — the off-chain
+  platform tables (soft-delete only; metadata, never authoritative).
