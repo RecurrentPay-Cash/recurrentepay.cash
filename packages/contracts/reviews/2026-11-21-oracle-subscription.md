@@ -8,8 +8,9 @@
 Spec: `openspec/changes/recurrent-pay-mvp/specs/subscription-contract/spec.md` (frozen),
 design.md § Oracle coupling of `settle()` and § Security Notes.
 **Mode**: Full report. Read-only — no contract/test/openspec changes made, nothing committed.
-**Suite status**: `oracle-*` suites run `--runInBand` (parallel workers OOM). 12 suites, **84 tests,
-all green** (see note on run duration below).
+**Suite status**: 12 oracle suites run `--runInBand` (parallel workers OOM) → **12 suites, 85 tests,
+all green** (~26 min). The tester reported 84; the actual Jest count is 85 (one test uses a
+declaration form my `grep -c "it("` inventory missed).
 
 > **Post-review resolution (2026-11-22).** The verification findings below were acted on after this
 > report was written, before archive:
@@ -27,8 +28,17 @@ all green** (see note on run duration below).
 > - **Finding 6** (`newFunds` definition token-shaped) — noted; the contract uses the single-UTXO
 >   definition (`state output value − covenant input value`), documented inline.
 >
-> Suite after fixes: **88 oracle tests green** (`--runInBand`). Only Findings 7–9 (all "no fix
-> required" confirmations) and the accepted-exposure cancel/pull divergence remain open by design.
+> **Additional bug found during post-review verification (not in this report's original findings) —
+> FIXED.** `reactivate` mode A under-counted fresh funding by `gppNew` (the prepaid period is paid
+> out, so `stateOut − balance` missed it), so a supporter funding **exactly one period** was
+> rejected — contradicting the spec's "at least one fresh period funded" gate. The block also had an
+> unused `contractBalance` (compiler warning) and a tautological `require` (`x == x`). Fixed in
+> `c2b2e36` (add `gppNew` back to `newFunds` in mode A; use `contractBalance` in the require); test
+> `mode A accepts exactly one fresh period` added. This was a **funding-gate** bug (valid reactivate
+> reverted), not a fund-loss bug. New bytecode 4926.5 B, compile warning-free.
+>
+> Suite after fixes: **all 12 oracle suites green** (`--runInBand`; Jest reports 85 tests — the
+> count in § Test-coverage below reflects the pre-fix suite and is superseded by this note).
 
 ---
 
@@ -448,5 +458,11 @@ DUST sentence) and lose ~2 (re-scope the token-shaped scenarios).
 (`packages/contracts/artifacts/oracle-subscription.artifact.js`) was not diffed against the source
 byte-for-byte; I assumed `pnpm compile` was run before the suite (the green suite implies it was).
 The txserver and web specs were out of scope. The full `pnpm --filter contracts test` suite was
-**not** run (23 min; the instruction forbids it) — only the `oracle-*` suites were run
-`--runInBand`.
+**not** run (23 min; the instruction forbids it) — only the 12 `oracle-*.test.ts` suites were run
+`--runInBand`, and all 85 tests passed.
+
+> **Run note:** the first attempt used `--testPathPattern oracle-`, which Jest treats as a
+> substring match against the full path — it also matched the **token** suites (the path contains
+> `oracle-contract/`), ran the ~23-min token suite, and timed out on two slow token tests
+> (`fund.test.ts:49`, `scam.test.ts:89`). That was a pattern bug, not an oracle failure. The
+> anchored pattern (`oracle-(...).test.ts$`) ran exactly the 12 oracle files: 85/85 green.
