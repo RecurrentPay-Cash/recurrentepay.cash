@@ -4,3 +4,9 @@ openspec/spec-ideas
 .markdownlint.json
 .env
 apps/*/.env
+
+# Local working notes / cross-worktree handoffs — not project artifacts
+server-requirements.md
+txserver-oracle-handoff.md
+txserver-requirements-handoff.md
+txserver-requirements-dapp-handoff.md
