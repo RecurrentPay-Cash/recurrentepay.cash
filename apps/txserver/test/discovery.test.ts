@@ -9,9 +9,14 @@
 import { DataSource } from 'typeorm';
 import { encodeCommitment } from 'shared';
 import { Subscription } from '../src/db/subscription.entity.js';
+import { Notification } from '../src/db/notification.entity.js';
+import { WebhookEndpoint } from '../src/db/webhook-endpoint.entity.js';
 import { SubscriptionRepository } from '../src/subscription/subscription.repository.js';
 import { DerivedStateService } from '../src/subscription/derived-state.service.js';
 import { DiscoveryService } from '../src/discovery/discovery.service.js';
+import { NotificationService } from '../src/notifications/notification.service.js';
+import { NotificationRepository } from '../src/notifications/notification.repository.js';
+import { WebhookEndpointRepository } from '../src/notifications/webhook-endpoint.repository.js';
 import { MockChainWatcher } from '../src/watcher/mock-chain-watcher.js';
 import { covenantLockingBytecode } from 'shared';
 import artifact from 'contracts/artifacts/token-subscription.artifact.js';
@@ -41,18 +46,19 @@ function canonical(over: Partial<GenesisSpec> = {}): GenesisSpec {
 describe('DiscoveryService', () => {
   let dataSource: DataSource;
   let watcher: MockChainWatcher;
+  let repository: SubscriptionRepository;
   let service: DiscoveryService;
 
   beforeEach(async () => {
     dataSource = new DataSource({
       type: 'better-sqlite3',
       database: ':memory:',
-      entities: [Subscription],
+      entities: [Subscription, Notification, WebhookEndpoint],
       synchronize: true,
     });
     await dataSource.initialize();
     watcher = new MockChainWatcher();
-    const repository = new SubscriptionRepository(dataSource.getRepository(Subscription));
+    repository = new SubscriptionRepository(dataSource.getRepository(Subscription));
     service = new DiscoveryService(watcher, repository);
   });
 
@@ -159,7 +165,6 @@ describe('DiscoveryService', () => {
     // Construct the service with a real DerivedStateService (the production
     // wiring) rather than re-implementing the listener inline. This exercises
     // `DiscoveryService.onModuleInit` → `onChainChange` → `derivedState.refresh`.
-    const repository = new SubscriptionRepository(dataSource.getRepository(Subscription));
     const derivedState = new DerivedStateService(watcher, repository);
     const wired = new DiscoveryService(watcher, repository, derivedState);
     wired.onModuleInit();
@@ -228,6 +233,44 @@ describe('DiscoveryService', () => {
     expect(result.tracked).toBe(false);
     expect(await dataSource.getRepository(Subscription).count()).toBe(0);
     expect(watcher.subscribedOutpoints()).toHaveLength(0);
+  });
+
+  it('emits a `created` notification to all three parties on a new sub (spec § Notifications item h)', async () => {
+    // Wire the real NotificationService (persist-before-deliver) so the test
+    // proves the event reaches the durable log, not just that `emit` was called.
+    const notifications = new NotificationRepository(dataSource.getRepository(Notification));
+    const endpoints = new WebhookEndpointRepository(dataSource.getRepository(WebhookEndpoint));
+    const notificationService = new NotificationService(notifications, endpoints, async () => ({
+      ok: true,
+      status: 200,
+    }));
+    const wired = new DiscoveryService(watcher, repository, undefined, notificationService);
+
+    watcher.setRawTx('genesis-tx', buildGenesisTx(canonical()));
+    await wired.discover({ txid: 'genesis-tx', stateCategory: STATE_CAT });
+
+    const rows = await notifications.findBySubscription(STATE_CAT, 10);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.type).toBe('created');
+    // Persisted before delivery: the row exists and is marked delivered (no
+    // webhook endpoints registered → in-dapp only).
+    expect(rows[0]!.deliveredAt).not.toBeNull();
+  });
+
+  it('does not re-emit `created` on a re-discovery of an already-tracked sub', async () => {
+    const notifications = new NotificationRepository(dataSource.getRepository(Notification));
+    const endpoints = new WebhookEndpointRepository(dataSource.getRepository(WebhookEndpoint));
+    const notificationService = new NotificationService(notifications, endpoints, async () => ({
+      ok: true,
+      status: 200,
+    }));
+    const wired = new DiscoveryService(watcher, repository, undefined, notificationService);
+
+    watcher.setRawTx('genesis-tx', buildGenesisTx(canonical()));
+    await wired.discover({ txid: 'genesis-tx', stateCategory: STATE_CAT });
+    await wired.discover({ txid: 'genesis-tx', stateCategory: STATE_CAT });
+
+    expect(await notifications.count()).toBe(1);
   });
 });
 

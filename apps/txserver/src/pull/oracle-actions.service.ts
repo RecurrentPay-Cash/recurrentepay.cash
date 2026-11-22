@@ -253,7 +253,7 @@ export class OracleActionsService {
     const state = oracle.decodeCommitment(hexToBin(stateUtxo.token!.nft!.commitment));
     const balance = stateUtxo.satoshis;
 
-    const price = await this.freshPrice(sub, state, now, 'withdraw');
+    const { price, fresh } = await this.freshPrice(sub, state, now, 'withdraw');
     const settlement = oracle.settleOracle(state, balance - oracle.DUST, now, price);
 
     const nextState: OracleNs.OracleState = {
@@ -277,10 +277,8 @@ export class OracleActionsService {
     const unlock = contract.unlock as unknown as Record<string, (...args: any[]) => Unlocker>;
     const covenantLock = hexToBin(contract.lockingBytecode);
 
-    const fresh = this.requireFresh(sub.stateCategory);
     const tx = new TransactionBuilder({ provider: this.provider }).setLocktime(now);
     tx.addInput(stateUtxo, unlock['withdraw']!(fresh.sig, fresh.message, fresh.pubkey));
-
     const payments: Output[] =
       settlement.gross > 0n
         ? [
@@ -361,7 +359,7 @@ export class OracleActionsService {
     const state = oracle.decodeCommitment(hexToBin(stateUtxo.token!.nft!.commitment));
     const balance = stateUtxo.satoshis;
 
-    const price = await this.freshPrice(sub, state, now, 'reactivate');
+    const { price, fresh } = await this.freshPrice(sub, state, now, 'reactivate');
 
     const gppOld = oracle.grossPerPeriod(state.amount, price);
     const gppNew = oracle.grossPerPeriod(state.amountNext, price);
@@ -399,10 +397,8 @@ export class OracleActionsService {
     const unlock = contract.unlock as unknown as Record<string, (...args: any[]) => Unlocker>;
     const covenantLock = hexToBin(contract.lockingBytecode);
 
-    const fresh = this.requireFresh(sub.stateCategory);
     const tx = new TransactionBuilder({ provider: this.provider }).setLocktime(now);
     tx.addInput(stateUtxo, unlock['reactivate']!(fresh.sig, fresh.message, fresh.pubkey));
-
     // The funding input(s): the caller's P2PKH UTXO(s), assembled as unsigned
     // placeholders. The client signs them before broadcast (the relay model).
     const signableInputs: SignableInput[] = [];
@@ -500,8 +496,9 @@ export class OracleActionsService {
     let price: bigint;
     let args: { sig: Uint8Array; message: Uint8Array; pubkey: Uint8Array };
     if (mutual) {
-      price = await this.freshPrice(sub, state, now, 'migrate');
-      args = this.requireFresh(sub.stateCategory);
+      const fresh = await this.freshPrice(sub, state, now, 'migrate');
+      price = fresh.price;
+      args = fresh.fresh;
     } else {
       price = BigInt(state.lastRate);
       // The contract's `verifyOracle` is skipped on the service path, so the
@@ -728,19 +725,26 @@ export class OracleActionsService {
   }
 
   /**
-   * Fetch a fresh signed oracle message and return the price (cents/BCH).
+   * Fetch a fresh signed oracle message and return the price + the args the
+   * unlocker needs.
    *
    * The pubkey is resolved from the subscription row and re-verified against the
    * live commitment (the commitment carries only `hash160(oraclePk)`). A missing
    * pubkey or a non-fresh message throws `OracleActionDeferredError` — the caller
    * retries next cycle and never broadcasts a stale/partial tx.
+   *
+   * The message is **returned** (not stashed in a shared map), so two concurrent
+   * builds for the same subscription can never read each other's message.
    */
   private async freshPrice(
     sub: Subscription,
     state: OracleNs.OracleState,
     now: number,
     action: 'withdraw' | 'reactivate' | 'migrate',
-  ): Promise<bigint> {
+  ): Promise<{
+    price: bigint;
+    fresh: { sig: Uint8Array; message: Uint8Array; pubkey: Uint8Array };
+  }> {
     const pubkey = this.resolvePubkey(sub, state, action);
     const fresh = await this.oracleClient.fetchFresh(toHex(state.oraclePkHash), pubkey, {
       now,
@@ -750,31 +754,14 @@ export class OracleActionsService {
     if (!fresh.fresh) {
       throw new OracleActionDeferredError(sub.stateCategory, action, fresh.reason);
     }
-    this.lastFresh.set(sub.stateCategory, {
-      sig: hexToBin(fresh.message.signature),
-      message: hexToBin(fresh.message.messageHex),
-      pubkey: hexToBin(fresh.message.pubkey),
-    });
-    return BigInt(fresh.message.message.price);
-  }
-
-  /** The most recent fresh oracle args per subscription (set by `freshPrice`). */
-  private readonly lastFresh = new Map<
-    string,
-    { sig: Uint8Array; message: Uint8Array; pubkey: Uint8Array }
-  >();
-
-  /** The fresh oracle args for a subscription (set by `freshPrice` this build). */
-  private requireFresh(subscriptionId: string): {
-    sig: Uint8Array;
-    message: Uint8Array;
-    pubkey: Uint8Array;
-  } {
-    const fresh = this.lastFresh.get(subscriptionId);
-    if (fresh === undefined) {
-      throw new Error(`oracle actions: no fresh message for ${subscriptionId}`);
-    }
-    return fresh;
+    return {
+      price: BigInt(fresh.message.message.price),
+      fresh: {
+        sig: hexToBin(fresh.message.signature),
+        message: hexToBin(fresh.message.messageHex),
+        pubkey: hexToBin(fresh.message.pubkey),
+      },
+    };
   }
 
   /** Resolve + re-verify the oracle pubkey against the live commitment. */

@@ -64,6 +64,36 @@ store.
 | `POST` | `/proposals/:id/revoke` | **The initiator** revokes a pending proposal |
 | `GET` | `/proposals/:id` | Read a proposal (party-scoped) |
 | `GET` | `/subscriptions/:stateCategory/proposals` | List a sub's proposals (party-scoped) |
+| `POST` | `/subscriptions/:stateCategory/withdraw/prepare` | **Supporter** prepares an oracle `withdraw`: unsigned hex + `signableInputs` |
+| `POST` | `/subscriptions/:stateCategory/withdraw/broadcast` | Relay the client-signed withdraw (`{ signedHex }`) |
+| `POST` | `/subscriptions/:stateCategory/reactivate/prepare` | **Supporter** prepares an oracle `reactivate` (fresh funding inputs) |
+| `POST` | `/subscriptions/:stateCategory/reactivate/broadcast` | Relay the client-signed reactivate (`{ signedHex }`) |
+| `POST` | `/subscriptions/:stateCategory/migrate/prepare` | Prepare an oracle-key `migrate` (`mode: mutual\|service`) |
+| `POST` | `/subscriptions/:stateCategory/migrate/broadcast` | Relay the client-signed mutual migrate (`{ signedHex }`) |
+| `POST` | `/subscriptions/:stateCategory/oracle-migrate` | **Service-only** oracle migrate — the dead-oracle recovery (server-signed + broadcast) |
+| `POST` | `/subscriptions/discover` | Register a sub from its genesis tx (the web app's creation hook; authenticated) |
+
+### Oracle-action routes (prepare → client-sign → broadcast)
+
+The oracle (`withdraw`/`reactivate`/`migrate`) routes follow the same **prepare → client-sign →
+broadcast** model as the relay: the server **rebuilds** the tx against the current outpoints and
+returns the **unsigned** hex + the `signableInputs` the client must sign; the client signs each
+presence/funding input (`SIGHASH_ALL | SIGHASH_FORKID`) and calls `broadcast`, which verifies the
+signed tx spends the live state outpoint before relaying it. The server holds **no party key**.
+
+`POST /subscriptions/:stateCategory/oracle-migrate` is the exception: it is the **service
+dead-oracle recovery** path — the server holds the service key by design, so it builds and
+broadcasts directly (priced at the stored `lastRate`, no oracle message needed) and updates the row
+to the new oracle.
+
+### `POST /subscriptions/discover` — the creation trigger
+
+Discovery is the **web app's** creation hook: after the wallet creates a sub on-chain, the app calls
+this route (authenticated as a party) to have the txserver validate the genesis and start watching.
+It is intentionally **authenticated** (class-level `AuthGuard`), so only a party can register a sub;
+party-scoped routes are never weakened. The txserver's **own chain-scan path**
+(`DiscoveryService.onModuleInit` → `watcher.onChange`) calls `DiscoveryService.discover` internally
+and needs no route, so no unauthenticated variant is exposed.
 
 **`channel`/`plan` filters join through `subscription_link`** (Slice 6): filtering by a channel or
 plan returns only the linked subs; an unknown channel/plan yields `[]` (fail-closed, never
@@ -153,7 +183,12 @@ the flow:
 - **`migrate`** — the token path swaps the escrow's funds category. The caller supplies the
   new-category token UTXO(s) as `newAssetInputs`; the relay sets `newEscrow = totalIn(newCategory)`
   (the contract's own accounting) and returns the old-asset remainder to the supporter. The oracle
-  `migrate` (oracle-key swap) is a marked TODO — it needs the oracle contract artifact.
+  `migrate` (oracle-key swap) is **fully implemented** in `OracleActionsService` and VM-tested:
+  `POST /subscriptions/:stateCategory/migrate/prepare|broadcast` is the **mutual** path (both parties
+  present, priced at the current oracle — a fresh message is required) and
+  `POST /subscriptions/:stateCategory/oracle-migrate` is the **service** path (the dead-oracle
+  recovery: no message, priced at the stored `lastRate`, server-signed). Both settle, then swap
+  `oraclePkHash` to `hash160(newOraclePubkey)`.
 
 **Client-side signing (security).** The relay **never accepts and never holds a private key**. Each
 party's presence input is supplied as an outpoint + satoshis + P2PKH lock; the covenant's `isPresent`
@@ -182,6 +217,18 @@ of the recipient parties:
 - **Secret at rest:** the per-party HMAC `secret` is stored **plaintext** in Postgres for the MVP
   (the receiver needs it to verify the signature). Encrypting it at rest is post-MVP; a DB dump
   currently leaks the signing keys.
+
+### Scope notes (honest "not implemented" list)
+
+- **Token-path `fund`/`withdraw`/`reactivate` builders are web-app scope, not server.** The txserver
+  only builds the **oracle** `withdraw`/`reactivate`/`migrate` (client-driven prepare/broadcast) and
+  the server-signed `oracle-migrate`. The token contract's `fund` (stray absorption),
+  `withdraw` and `reactivate` are built by the **web app** via the shared package; the txserver
+  exposes no route for them. This is an explicit deferral, not a gap in the server's money paths.
+- **Reorg notification reconciliation is design-deferred.** The derived-state cache re-derives from
+  the winning chain on every change (reorg-safe), but the notification log is **not** reconciled on
+  a reorg (a notification emitted for a now-orphaned spend is not retracted). Documented as
+  post-MVP in `design.md` § Operational safety.
 
 ## Database
 

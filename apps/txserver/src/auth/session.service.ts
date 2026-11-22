@@ -112,8 +112,9 @@ export class SessionService {
   validate(token: string, now: number = Math.floor(Date.now() / 1000)): string | null {
     const entry = this.sessions.get(token);
     if (entry === undefined) return null;
-    // Expired sessions are rejected but not evicted: a validate at a smaller
-    // "now" (tests, or a clock correction) must still see the session.
+    // `validate` never evicts: it only rejects an expired session, so a validate
+    // at a smaller "now" (tests, or a clock correction) still sees the session.
+    // Eviction happens on the next `session` (see `evictExpired`).
     if (entry.expiresAt < now) return null;
     return entry.pkh;
   }

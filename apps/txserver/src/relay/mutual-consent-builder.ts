@@ -500,14 +500,13 @@ function unlockPresence(input: CounterpartyInput): Unlocker {
   } as unknown as Unlocker;
 }
 
-
-
 /** The sum of the new-category funding inputs (the contract's `totalIn`). */
 function totalIn(inputs: readonly NewAssetInput[], category: string): bigint {
   return inputs
     .filter((i) => i.category.toLowerCase() === category.toLowerCase())
     .reduce((sum, i) => sum + i.amount, 0n);
 }
+
 /** A P2PKH locking bytecode for a 20-byte pkh. */
 function p2pkhLock(pkh: Uint8Array): Uint8Array {
   return Uint8Array.from([0x76, 0xa9, 0x14, ...pkh, 0x88, 0xac]);

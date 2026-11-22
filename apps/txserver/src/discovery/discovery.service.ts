@@ -9,7 +9,7 @@
  * The webhook/API surface itself is Slice 4; this service method is the internal
  * trigger the API and the chain-scan path both call.
  */
-import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional, type OnModuleInit } from '@nestjs/common';
 import { binToHex, hash160, hexToBin } from '@bitauth/libauth';
 import { oracle, toDisplayCategory } from 'shared';
 import tokenArtifact from 'contracts/artifacts/token-subscription.artifact.js';
@@ -17,6 +17,7 @@ import oracleArtifact from 'contracts/artifacts/oracle-subscription.artifact.js'
 import { CHAIN_WATCHER, type ChainWatcher } from '../watcher/chain-watcher.js';
 import { SubscriptionRepository } from '../subscription/subscription.repository.js';
 import { DerivedStateService, type WatchedSubscription } from '../subscription/derived-state.service.js';
+import { NotificationService } from '../notifications/notification.service.js';
 import { validateGenesis } from './genesis-validation.js';
 
 export interface DiscoverInput {
@@ -48,6 +49,7 @@ export class DiscoveryService implements OnModuleInit {
     @Inject(CHAIN_WATCHER) private readonly watcher: ChainWatcher,
     private readonly repository: SubscriptionRepository,
     private readonly derivedState?: DerivedStateService,
+    @Optional() private readonly notifications?: NotificationService,
   ) {}
 
   /**
@@ -158,6 +160,12 @@ export class DiscoveryService implements OnModuleInit {
     // spend that moves both outpoints is picked up automatically.
     await this.watcher.subscribe(covenantLockingBytecode);
 
+    await this.emitCreated(input.stateCategory, {
+      supporterPkh: hex(tokenState.supporterPkh),
+      supporteePkh: hex(tokenState.supporteePkh),
+      servicePkh: hex(tokenState.servicePkh),
+    });
+
     this.logger.log(`tracking subscription ${input.stateCategory} (genesis ${input.txid})`);
     return {
       tracked: true,
@@ -216,12 +224,44 @@ export class DiscoveryService implements OnModuleInit {
 
     await this.watcher.subscribe(genesis.covenantLockingBytecode);
 
+    await this.emitCreated(input.stateCategory, {
+      supporterPkh: hex(state.supporterPkh),
+      supporteePkh: hex(state.supporteePkh),
+      servicePkh: hex(state.servicePkh),
+    });
+
     this.logger.log(`tracking oracle subscription ${input.stateCategory} (genesis ${input.txid})`);
     return {
       tracked: true,
       stateCategory: input.stateCategory,
       covenantAddress: genesis.covenantLockingBytecode,
     };
+  }
+
+  /**
+   * Emit the `created` notification (spec § Notifications item h) to all three
+   * parties, persist-before-deliver.
+   *
+   * Emitted **after** the row is persisted and the address subscribed, so the
+   * log's first event is the creation. Idempotent: `NotificationService.emit`
+   * dedupes on the idempotency key, and `discover` returns early for a sub that
+   * is already tracked, so a re-discovery never re-emits.
+   *
+   * `notifications` is an optional dependency: the genesis-validation tests
+   * construct the service without it (they assert tracking, not notification).
+   */
+  private async emitCreated(
+    stateCategory: string,
+    parties: { supporterPkh: string; supporteePkh: string; servicePkh: string },
+  ): Promise<void> {
+    if (this.notifications === undefined) return;
+    const recipients = [parties.supporterPkh, parties.supporteePkh, parties.servicePkh].map((p) =>
+      p.toLowerCase(),
+    );
+    await this.notifications.emit(
+      { type: 'created', subscriptionId: stateCategory, at: Math.floor(Date.now() / 1000) },
+      { recipients },
+    );
   }
 }
 

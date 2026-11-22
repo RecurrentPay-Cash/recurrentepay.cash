@@ -309,6 +309,52 @@ describe('REST API', () => {
     expect(res.body.map((s: { stateCategory: string }) => s.stateCategory)).toEqual([OTHER_CAT]);
   });
 
+  it('surfaces the scheduler `degraded` marker through the API (spec § Oracle integration)', async () => {
+    // The scheduler writes `status: 'degraded'` when a non-fresh oracle message
+    // defers a pull. `deriveRow` recomputes status from the cache, so it must
+    // honor the stored marker — otherwise the degraded state is invisible.
+    await seedSubscription({
+      stateCategory: STATE_CAT,
+      supporterPkh: A_PKH,
+      status: 'degraded',
+      escrowBalance: 101n,
+    });
+
+    const res = await request(app.getHttpServer())
+      .get('/subscriptions')
+      .set('Authorization', `Bearer ${aToken}`)
+      .expect(200);
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].status).toBe('degraded');
+
+    // A canceled sub (state outpoint gone) is never degraded — the terminal
+    // state wins over the stale marker.
+    await repository.upsert({
+      stateCategory: OTHER_CAT,
+      stateOutpoint: null,
+      escrowOutpoint: null,
+      assetType: 'token',
+      fundsCategory: FUNDS_CAT,
+      mode: 1,
+      supporterPkh: A_PKH,
+      supporteePkh: SUPPORTEE_PKH,
+      servicePkh: SERVICE_PKH,
+      amount: 10n,
+      amountNext: 10n,
+      period: DAY,
+      periodNext: DAY,
+      lastPeriodTime: T0,
+      escrowBalance: 0n,
+      status: 'degraded',
+      nextPaymentAt: T0 + DAY,
+    });
+    const canceled = await request(app.getHttpServer())
+      .get(`/subscriptions/${OTHER_CAT}`)
+      .set('Authorization', `Bearer ${aToken}`)
+      .expect(200);
+    expect(canceled.body.status).toBe('canceled');
+  });
+
   it('filters by channel and plan through subscription_link', async () => {
     // No link rows exist in this fixture DB → filtering by an unknown channel
     // still yields nothing (fail-closed, never "return everything").

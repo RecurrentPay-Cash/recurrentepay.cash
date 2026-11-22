@@ -387,6 +387,15 @@ export class SubscriptionsController {
   /**
    * Track a subscription from its genesis transaction (the creation webhook).
    *
+   * **Trigger (decision, review Major 1).** This route is the **web app's**
+   * creation hook: after a wallet creates a sub on-chain, the app calls this
+   * route (authenticated as a party) to have the txserver validate the genesis
+   * and start watching. It is intentionally **authenticated** (class-level
+   * `AuthGuard`) so only a party can register a sub. The txserver's **own
+   * chain-scan path** (`DiscoveryService.onModuleInit` → `watcher.onChange`)
+   * calls `DiscoveryService.discover` internally and needs no route, so no
+   * unauthenticated variant is exposed. Party-scoped routes are not weakened.
+   *
    * The creation path must capture the oracle pubkey for an oracle (BCH) sub: the
    * commitment stores only `hash160(oraclePk)`, so `oraclePubkey` (hex, compressed)
    * is supplied here and verified against the commitment's `oraclePkHash` by the
@@ -547,6 +556,14 @@ function deriveRow(row: Subscription, now: number): ReturnType<typeof deriveStat
   const escrow = BigInt(row.escrowBalance);
   if (row.stateOutpoint === null) {
     return deriveState({ state: undefined, escrow, now });
+  }
+  // Surface the scheduler's `degraded` marker (a non-fresh oracle message deferred
+  // the pull; spec § Oracle integration — Oracle fetch failure degrades safely).
+  // It is a stored, internal retry flag, not a clock-derived state, so it takes
+  // precedence over the recomputed `active|paused|due` — the dashboard needs to
+  // see "oracle degraded". A canceled sub is never degraded.
+  if (row.status === 'degraded') {
+    return { ...deriveState({ state: undefined, escrow, now }), status: 'degraded' };
   }
   // The cache row carries the commitment fields; rebuild the state from them so
   // the clock-based derivation (n/m/arrears) is exact without a chain round-trip.
