@@ -10,6 +10,12 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
 > new work lands. Pre-work disclosure is unchanged in scope — this is a spec revision to the same
 > pre-hackathon artifact, done during BLAZE.
 
+> **Revision (Nov 21) — oracle coupling resolved; oracle contract unblocked.** §3.0 is resolved
+> (design.md § Oracle coupling of `settle()`): most paths price at the current oracle, `cancel` and
+> service `migrate` price at a stored `lastRate`; migrate auth = `supporter + supportee` OR `service`;
+> the oracle key is stored as `oraclePkHash` (`hash160`, 20 B) with the pubkey passed as an unlock
+> arg; the oracle commitment is 113 B (fields 1–11). The token contract is unaffected.
+
 ## Sprint 1 — Contracts Prep (Nov 10–13)
 
 ### 1. Repo & toolchain
@@ -76,14 +82,24 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
   template — needs that template kept in sync forever, hence not in the MVP factory
 
 ### 3. Contracts — oracle (`oracle-subscription.cash`)
-- [ ] 3.0 **BLOCKED:** resolve `settle()` oracle coupling (design.md § Oracle coupling) — options (a)/(b)/(c). Token contract proceeds without this.
-- [ ] 3.1 Oracle message verification (`checkDataSig`, freshness bound, GP format)
-- [ ] 3.2 `pull` — USD → sats conversion for `m × amount`, partial settle when short, recreate; fee
-  floor = fixed **1000 sats** (`MIN_FEE_PER_PERIOD`); note oracle-derived cent as v2
-- [ ] 3.3 `cancel` / `modify` / `setPkh` / `migrate` / `fund` / `withdraw` / `reactivate` — oracle
-  variants. **No co-creation and no seed** (single UTXO: the state NFT and the sats share one
-  output; the balance is that input's value, never a transaction-wide sum). Cleanup and fee
-  mirrored from the token contract
+- [ ] 3.0 **UNBLOCKED (Nov 21):** `settle()` oracle coupling resolved (design.md § Oracle coupling).
+  Rate sources: `pull`/`reactivate`/mutual-`migrate`/`withdraw` = **current oracle**;
+  `cancel`/service-`migrate` = **stored `lastRate`**. Migrate auth = `supporter + supportee` OR
+  `service`. Oracle key stored as `oraclePkHash` (`hash160`, 20 B), pubkey as unlock arg. Commitment
+  113 B (fields 1–11). Token contract proceeds independently.
+- [x] 3.1 Oracle message verification (`checkDataSig` on the GP 16-byte message; `hash160(pubkey) ==
+  oraclePkHash`; freshness bounds: `messageTimestamp <= tx.locktime`, `>= lastPeriodTime + n·period`,
+  `tx.locktime − messageTimestamp <= FRESHNESS` (= 1h), `contentSequence > 0`)
+- [x] 3.2 `pull` — USD → sats conversion for `m × amount`, partial settle when short, recreate; fee
+  floor = fixed **1000 sats** (`MIN_FEE_PER_PERIOD`); write `lastRate`; note oracle-derived cent as v2
+- [x] 3.3 `cancel` (no oracle message — prices at `lastRate`) / `modify` / `setPkh` / `migrate`
+  (mutual = oracle, service = `lastRate`, swaps `oraclePkHash`) / `fund` / `withdraw` (oracle) /
+  `reactivate` (oracle — future period). **No co-creation and no seed** (single UTXO: the state NFT
+  and the sats share one output; the balance is that input's value, never a transaction-wide sum).
+  Cleanup and fee mirrored from the token contract. **DUST reserve (1000 sats) = single-UTXO seed
+  analogue** (spec.md § Escrow identity)
+- [x] 3.4 `lastRate` lifecycle — init at creation (creation tx carries the first oracle message),
+  written by every oracle-priced settle, read-never-written by `cancel`/service-migrate
 
 ### 4. Contract tests (MockNetworkProvider)
 - [x] 4.1 Test harness: wallets, mock oracle (HodlVault pattern), commitment builders, covenant helpers
@@ -121,6 +137,12 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
   rejected, clock-advance-while-unfunded rejected)
 - [ ] 4.18 Scam scenarios (new): false-funding via a stray rejected; escrow omitted rejected per
   function; the seed is not withdrawable
+- [x] 4.19 **Oracle contract:** rate-source matrix (`pull`/`reactivate`/mutual-`migrate`/`withdraw`
+  = oracle; `cancel`/service-`migrate` = `lastRate`); GP 16-byte message parsing; freshness bounds
+  (stale, future-dated, earlier-period, metadata all rejected); wrong-key (`hash160(pubkey) !=
+  oraclePkHash`) rejected; `lastRate` init at creation and updated only by oracle-priced settles;
+  dead-oracle matrix (only `cancel` + service `migrate` succeed); service-migrate swaps `oraclePkHash`
+  and settles at `lastRate`; cancel/pull rate divergence bounded by one period. 88 oracle tests green.
 
 ### 5. Sprint 1 review (Nov 13)
 - [ ] 5.1 Full suite green; contracts frozen for hackathon — **void: re-opened Nov 16** (see the
@@ -148,8 +170,12 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
 - [ ] 7.6 **Creation builder** — the two-tx flow: build carrier `P` (output 0 = genesis carrier),
   sign, hash → `stateCategory`, derive the covenant address, build creation `C` (one `mutable` state
   NFT + escrow ≥ `amount + seed`, co-created), sign, broadcast `P` then `C`. Enforce the creation
-  invariants (single `mutable` NFT, no `minting`, `amountNext = amount`). Shared by web + tests;
+  invariants (single `mutable` NFT, no `minting`, `amountNext = amount`). **Oracle subs:** include the
+  first oracle message and initialize `lastRate` (and store `oraclePkHash`). Shared by web + tests;
   unit-test the category/address derivation against the signed carrier bytes
+- [ ] 7.7 **Oracle helpers** — GP 16-byte message parse/serialize; `oraclePkHash` ↔ pubkey mapping;
+  freshness validation (`<= now`, `>= periodStart`, `<= FRESHNESS`, `contentSequence > 0`);
+  `gross_sats = m·amount_cents·1e8/price_cents`. Unit tests incl. stale/future/earlier-period cases
 
 ### 8. TxServer (NestJS)
 - [ ] 8.1 Scaffold NestJS app, config module (env secrets), Postgres + migrations
@@ -157,7 +183,9 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
   spend), **0-conf (mempool) subscriptions** — react on broadcast acceptance, not block
   confirmation — stray detection, event handling
 - [ ] 8.3 Derived state engine: status computation (escrow-based), next-payment estimate, caching
-- [ ] 8.4 Oracle client: oracles.cash REST fetch + validation
+- [ ] 8.4 Oracle client: oracles.cash REST fetch + validation (GP 16-byte message); `oraclePkHash` →
+  pubkey mapping; freshness-window enforcement (wait for a fresh message, never submit a stale one);
+  build `cancel`/service-`migrate` with **no** message (prices at `lastRate`)
 - [ ] 8.5 Pull executor: build/sign/broadcast, idempotency guard
 - [ ] 8.6 Scheduler: due scan loop, buffer-warning trigger
 - [ ] 8.7 REST API: subscriptions by party, detail (incl. arrears `n'`), notifications, auto-cancel policy config
