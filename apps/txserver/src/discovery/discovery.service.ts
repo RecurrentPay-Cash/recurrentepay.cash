@@ -10,8 +10,10 @@
  * trigger the API and the chain-scan path both call.
  */
 import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
-import { toDisplayCategory } from 'shared';
-import artifact from 'contracts/artifacts/token-subscription.artifact.js';
+import { binToHex, hash160, hexToBin } from '@bitauth/libauth';
+import { oracle, toDisplayCategory } from 'shared';
+import tokenArtifact from 'contracts/artifacts/token-subscription.artifact.js';
+import oracleArtifact from 'contracts/artifacts/oracle-subscription.artifact.js';
 import { CHAIN_WATCHER, type ChainWatcher } from '../watcher/chain-watcher.js';
 import { SubscriptionRepository } from '../subscription/subscription.repository.js';
 import { DerivedStateService, type WatchedSubscription } from '../subscription/derived-state.service.js';
@@ -24,6 +26,14 @@ export interface DiscoverInput {
   stateCategory: string;
   /** Asset type; token subs are the Slice 2 path. */
   assetType?: 'token' | 'oracle';
+  /**
+   * Oracle subs only: the oracle public key (hex, compressed 33 B). The
+   * commitment stores only `hash160(oraclePk)`, so the pubkey must be captured
+   * at creation. When supplied it is verified against the commitment's
+   * `oraclePkHash` (mismatch → refuse to track); when absent the sub is tracked
+   * with `oraclePubkey` null and an oracle pull fails loudly ("unresolvable").
+   */
+  oraclePubkey?: string;
 }
 
 export type DiscoverResult =
@@ -88,9 +98,15 @@ export class DiscoveryService implements OnModuleInit {
       return { tracked: true, stateCategory: input.stateCategory, covenantAddress: existing.fundsCategory };
     }
 
+    const assetType = input.assetType ?? 'token';
+    // The covenant address is `f(stateCategory)`; the token and oracle contracts
+    // are different scripts, so the artifact must match the asset type.
+    const artifact = assetType === 'oracle' ? oracleArtifact : tokenArtifact;
+
     const rawTx = await this.watcher.getRawTx(input.txid);
     const validation = validateGenesis(rawTx, {
       stateCategory: input.stateCategory,
+      assetType,
       // Anchor the covenant script to `f(stateCategory)` (design.md § Creation).
       covenantBytecode: artifact.bytecode,
     });
@@ -102,26 +118,36 @@ export class DiscoveryService implements OnModuleInit {
     const { state, stateOutputIndex, escrowOutputIndex, escrowAmount, covenantLockingBytecode } =
       validation;
 
+    if (assetType === 'oracle') {
+      return this.trackOracle(input, state as oracle.OracleState, {
+        stateOutputIndex,
+        escrowAmount,
+        covenantLockingBytecode,
+      });
+    }
+
+    // The token path: `state` is the token commitment.
+    const tokenState = state as Exclude<typeof state, oracle.OracleState>;
     await this.repository.upsert({
       stateCategory: input.stateCategory,
       stateOutpoint: `${input.txid}:${stateOutputIndex}`,
       escrowOutpoint: `${input.txid}:${escrowOutputIndex}`,
-      assetType: input.assetType ?? 'token',
+      assetType,
       // The commitment stores `fundsCategory` in internal order; the entity and
       // `deriveEscrow` use display order (what Fulcrum/explorers report).
-      fundsCategory: toDisplayCategory(hex(state.fundsCategory)),
-      mode: state.mode,
-      supporterPkh: hex(state.supporterPkh),
-      supporteePkh: hex(state.supporteePkh),
-      servicePkh: hex(state.servicePkh),
-      amount: state.amount,
-      amountNext: state.amountNext,
-      period: state.period,
-      periodNext: state.periodNext,
-      lastPeriodTime: state.lastPeriodTime,
+      fundsCategory: toDisplayCategory(hex(tokenState.fundsCategory)),
+      mode: tokenState.mode,
+      supporterPkh: hex(tokenState.supporterPkh),
+      supporteePkh: hex(tokenState.supporteePkh),
+      servicePkh: hex(tokenState.servicePkh),
+      amount: tokenState.amount,
+      amountNext: tokenState.amountNext,
+      period: tokenState.period,
+      periodNext: tokenState.periodNext,
+      lastPeriodTime: tokenState.lastPeriodTime,
       escrowBalance: escrowAmount,
       status: 'active',
-      nextPaymentAt: state.lastPeriodTime + state.period,
+      nextPaymentAt: tokenState.lastPeriodTime + tokenState.period,
     });
 
     // Subscribe to the covenant **address** (locking bytecode), not the two
@@ -137,6 +163,64 @@ export class DiscoveryService implements OnModuleInit {
       tracked: true,
       stateCategory: input.stateCategory,
       covenantAddress: covenantLockingBytecode,
+    };
+  }
+
+  /**
+   * Track an oracle (BCH) sub: a single UTXO (state NFT + sats), so there is no
+   * escrow. The commitment's `oraclePkHash` is stored; the pubkey is captured
+   * only when the caller supplies it **and** it hashes back to the commitment's
+   * `oraclePkHash` (design.md § Oracle coupling — the pubkey is not recoverable
+   * from the hash). A mismatch refuses to track; absence leaves `oraclePubkey`
+   * null and an oracle pull fails loudly ("unresolvable").
+   */
+  private async trackOracle(
+    input: DiscoverInput,
+    state: oracle.OracleState,
+    genesis: { stateOutputIndex: number; escrowAmount: bigint; covenantLockingBytecode: string },
+  ): Promise<DiscoverResult> {
+    const oraclePkHash = hex(state.oraclePkHash);
+    let oraclePubkey: string | null = null;
+    if (input.oraclePubkey !== undefined && input.oraclePubkey !== '') {
+      const candidate = input.oraclePubkey.toLowerCase();
+      if (binToHex(hash160(hexToBin(candidate))) !== oraclePkHash) {
+        const reason = 'oracle pubkey does not hash to the commitment oraclePkHash';
+        this.logger.warn(`genesis rejected for ${input.txid}: ${reason}`);
+        return { tracked: false, reason };
+      }
+      oraclePubkey = candidate;
+    }
+
+    await this.repository.upsert({
+      stateCategory: input.stateCategory,
+      stateOutpoint: `${input.txid}:${genesis.stateOutputIndex}`,
+      escrowOutpoint: null,
+      assetType: 'oracle',
+      fundsCategory: '',
+      mode: state.mode,
+      supporterPkh: hex(state.supporterPkh),
+      supporteePkh: hex(state.supporteePkh),
+      servicePkh: hex(state.servicePkh),
+      amount: state.amount,
+      amountNext: state.amountNext,
+      period: state.period,
+      periodNext: state.periodNext,
+      lastPeriodTime: state.lastPeriodTime,
+      escrowBalance: genesis.escrowAmount,
+      status: 'active',
+      nextPaymentAt: state.lastPeriodTime + state.period,
+      oraclePkHash,
+      oraclePubkey,
+      lastRate: state.lastRate,
+    });
+
+    await this.watcher.subscribe(genesis.covenantLockingBytecode);
+
+    this.logger.log(`tracking oracle subscription ${input.stateCategory} (genesis ${input.txid})`);
+    return {
+      tracked: true,
+      stateCategory: input.stateCategory,
+      covenantAddress: genesis.covenantLockingBytecode,
     };
   }
 }

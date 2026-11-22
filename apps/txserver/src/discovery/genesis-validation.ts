@@ -25,6 +25,7 @@ import { decodeTransaction, hexToBin, binToHex } from '@bitauth/libauth';
 import {
   covenantLockingBytecode,
   decodeCommitment,
+  oracle,
   reverseCategory,
   SEED,
   type SubscriptionState,
@@ -40,18 +41,30 @@ export interface GenesisValidationOptions {
    * attacker-controlled script is rejected (design.md § Creation).
    */
   covenantBytecode?: string;
+  /**
+   * Asset type. `token` (default) expects the two-UTXO layout (state NFT +
+   * escrow); `oracle` expects the **single-UTXO** layout (state NFT + sats in
+   * one output, no escrow) and decodes the 113-byte **oracle** commitment.
+   */
+  assetType?: 'token' | 'oracle';
 }
+
+/** The decoded commitment — a token `SubscriptionState` or an oracle one. */
+export type GenesisState = SubscriptionState | oracle.OracleState;
 
 export type GenesisValidationResult =
   | {
       ok: true;
       /** The decoded commitment (authority for `amount`). */
-      state: SubscriptionState;
+      state: GenesisState;
       /** Index of the state-NFT output in the genesis tx. */
       stateOutputIndex: number;
-      /** Index of the escrow output in the genesis tx. */
+      /**
+       * Index of the escrow output in the genesis tx. `-1` for an oracle sub —
+       * the single-UTXO layout has no escrow.
+       */
       escrowOutputIndex: number;
-      /** The escrow amount (seed included). */
+      /** The escrow amount (seed included); the state output's value for oracle. */
       escrowAmount: bigint;
       /** The covenant locking bytecode hex (from the state output). */
       covenantLockingBytecode: string;
@@ -61,6 +74,7 @@ export type GenesisValidationResult =
 /** A libauth output with the token fields this check reads. */
 interface TokenOutput {
   lockingBytecode: Uint8Array;
+  valueSatoshis: bigint;
   token?: {
     category: Uint8Array;
     amount: bigint;
@@ -113,23 +127,12 @@ export function validateGenesis(
     return { ok: false, reason: `state NFT is not \`mutable\` (got ${stateNft.capability})` };
   }
 
-  // 4. The commitment must parse — it is the authority for `amount`.
-  let state: SubscriptionState;
-  try {
-    state = decodeCommitment(stateNft.commitment);
-  } catch (error) {
-    return { ok: false, reason: `state commitment does not parse: ${(error as Error).message}` };
-  }
-
-  // 5. The escrow is the funds-category output locked to the covenant script
-  //    (the same script as the state NFT). A co-created escrow locked elsewhere
-  //    would yield an unusable sub.
   const covenantLock = binToHex(stateOutput.o.lockingBytecode);
 
-  // 5a. Anchor the covenant script to `f(stateCategory)`: the covenant address is
-  //     derived from the state category, so a genesis whose state NFT (and escrow)
-  //     are both locked to an attacker-controlled script must be rejected. This is
-  //     the trust boundary that decides what gets watched.
+  // 3a. Anchor the covenant script to `f(stateCategory)` **before** decoding the
+  //     commitment: the covenant address is derived from the state category, so a
+  //     genesis whose state NFT is locked to an attacker-controlled script must be
+  //     rejected before its commitment is trusted (design.md § Creation).
   if (options.covenantBytecode !== undefined) {
     const expected = covenantLockingBytecode(
       reverseCategory(options.stateCategory),
@@ -140,7 +143,41 @@ export function validateGenesis(
     }
   }
 
-  // 5b. The escrow is the funds-category output locked to the covenant script.
+  // 3b. Oracle (BCH) subs: a **single UTXO** — the state NFT and the satoshis
+  //     share one output, there is no escrow and the commitment is the 113-byte
+  //     **oracle** layout (not the token one). The covenant lock is the oracle
+  //     artifact's `f(stateCategory)`; the balance is the state output's value.
+  if (options.assetType === 'oracle') {
+    let state: oracle.OracleState;
+    try {
+      state = oracle.decodeCommitment(stateNft.commitment);
+    } catch (error) {
+      return { ok: false, reason: `oracle state commitment does not parse: ${(error as Error).message}` };
+    }
+    return {
+      ok: true,
+      state,
+      stateOutputIndex: stateOutput.i,
+      escrowOutputIndex: -1,
+      escrowAmount: stateOutput.o.valueSatoshis,
+      covenantLockingBytecode: covenantLock,
+    };
+  }
+
+  // 4. The commitment must parse — it is the authority for `amount`.
+  let state: SubscriptionState;
+  try {
+    state = decodeCommitment(stateNft.commitment);
+  } catch (error) {
+    return { ok: false, reason: `state commitment does not parse: ${(error as Error).message}` };
+  }
+
+  // 5. The escrow is the funds-category output locked to the covenant script
+  //    (the same script as the state NFT). A co-created escrow locked elsewhere
+  //    would yield an unusable sub. The covenant lock was anchored to
+  //    `f(stateCategory)` in step 3a.
+
+  // 5a. The escrow is the funds-category output locked to the covenant script.
   //     The commitment's `fundsCategory` is internal, so it is compared against
   //     the raw output bytes (both internal).
   const fundsCategoryInternal = binToHex(state.fundsCategory);

@@ -43,6 +43,13 @@ export interface GenesisSpec {
   omitState?: boolean;
   /** Drop the escrow output (for the "no escrow" case). */
   omitEscrow?: boolean;
+  /**
+   * Oracle (BCH) genesis: the state NFT and the satoshis share **one** output
+   * (no escrow). The output's value is `oracleBalance` (default 1000).
+   */
+  oracle?: boolean;
+  /** Oracle genesis: satoshis parked on the single state output. */
+  oracleBalance?: bigint;
   /** Extra outputs appended after the canonical pair. */
   extraOutputs?: GenesisOutput[];
 }
@@ -68,7 +75,7 @@ export function buildGenesisTx(spec: GenesisSpec): string {
   if (spec.omitState !== true) {
     outputs.push({
       lockingBytecode: spec.stateLockingBytecode,
-      valueSatoshis: 1000n,
+      valueSatoshis: spec.oracle === true ? (spec.oracleBalance ?? 1000n) : 1000n,
       token: {
         category: spec.stateCategory,
         amount: 0n,
@@ -80,7 +87,9 @@ export function buildGenesisTx(spec: GenesisSpec): string {
     });
   }
 
-  if (spec.omitEscrow !== true) {
+  // Oracle (BCH) subs are a single UTXO — the state NFT and the sats share one
+  // output — so there is no escrow to co-create.
+  if (spec.omitEscrow !== true && spec.oracle !== true) {
     outputs.push({
       lockingBytecode: spec.escrowLockingBytecode,
       valueSatoshis: 1000n,

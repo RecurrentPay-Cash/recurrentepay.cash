@@ -18,7 +18,13 @@ import { DataSource } from 'typeorm';
 import { binToHex, decodeTransaction, hexToBin } from '@bitauth/libauth';
 import { MockNetworkProvider, SignatureTemplate, utils } from 'cashscript';
 import artifact from 'contracts/artifacts/token-subscription.artifact.js';
-import { covenantLockingBytecode, decodeCommitment, encodeCommitment, reverseCategory } from 'shared';
+import {
+  covenantLockingBytecode,
+  decodeCommitment,
+  encodeCommitment,
+  oracle,
+  reverseCategory,
+} from 'shared';
 import { Subscription } from '../src/db/subscription.entity.js';
 import { Account } from '../src/db/account.entity.js';
 import { Notification } from '../src/db/notification.entity.js';
@@ -607,6 +613,94 @@ describe('MutualConsentService', () => {
         now: T,
       }),
     ).rejects.toThrow(/oracle migrate is not implemented/i);
+  });
+
+  it('builds an oracle modify against the oracle artifact (VM-accepted)', async () => {
+    // An oracle (BCH) sub is a single UTXO (state NFT + sats). The builder must
+    // pick the oracle artifact — a token-script tx would be rejected by the
+    // oracle covenant. The oracle `modify(newAmountNext, newPeriodNext)` matches
+    // the token signature, but the layout is a single state output.
+    const ORACLE_ARTIFACT = (await import('contracts/artifacts/oracle-subscription.artifact.js'))
+      .default;
+    const oracleLock = covenantLockingBytecode(reverseCategory(STATE_CAT), ORACLE_ARTIFACT.bytecode);
+    const oracleState = {
+      supporterPkh: hexToBin(SUPPORTER_PKH),
+      supporteePkh: hexToBin(SUPPORTEE_PKH),
+      servicePkh: makeState().servicePkh,
+      amount: 10n,
+      amountNext: 10n,
+      period: DAY,
+      periodNext: DAY,
+      lastPeriodTime: T,
+      mode: 1 as const,
+      oraclePkHash: new Uint8Array(20).fill(0x55),
+      lastRate: 50_000,
+    };
+
+    const sub = await track({
+      assetType: 'oracle',
+      fundsCategory: '',
+      escrowOutpoint: null,
+    });
+    // The row's covenantAddress must resolve the oracle lock.
+    (sub as unknown as { covenantAddress: () => string }).covenantAddress = () => oracleLock;
+
+    const view = await relay.propose({
+      subscription: sub,
+      callerPkh: SUPPORTER_PKH,
+      kind: 'modify',
+      terms: { amountNext: '20', periodNext: DAY },
+      now: T,
+    });
+
+    // Seed the oracle covenant's single UTXO + both presence inputs.
+    provider.reset();
+    provider.addUtxo(oracleLock, {
+      txid: CO_TXID,
+      vout: 0,
+      satoshis: 21_000n,
+      token: {
+        category: STATE_CAT,
+        amount: 0n,
+        nft: { capability: 'mutable', commitment: binToHex(oracle.encodeCommitment(oracleState)) },
+      },
+    });
+    provider.addUtxo(p2pkh(SUPPORTER_PKH), { txid: INIT_TXID, vout: 0, satoshis: 1_000_000n });
+    provider.addUtxo(p2pkh(SUPPORTEE_PKH), { txid: CP_TXID, vout: 0, satoshis: 1_000_000n });
+
+    const prepared = await relay.prepare({
+      proposalId: view.id,
+      callerPkh: SUPPORTEE_PKH,
+      initiatorInput: presenceInput(INIT_TXID, SUPPORTER_PKH),
+      counterpartyInput: presenceInput(CP_TXID, SUPPORTEE_PKH),
+      now: T + 60,
+    });
+
+    const signedHex = signPrepared(prepared.unsignedHex, prepared.signableInputs, {
+      [p2pkh(SUPPORTER_PKH)]: SUPPORTER_KEY,
+      [p2pkh(SUPPORTEE_PKH)]: SUPPORTEE_KEY,
+    });
+
+    const result = await relay.broadcast({
+      proposalId: view.id,
+      callerPkh: SUPPORTEE_PKH,
+      signedHex,
+      now: T + 60,
+    });
+    expect(result.status).toBe('broadcast');
+
+    // The mock provider runs the tx against the oracle covenant's real bytecode.
+    await expect(provider.sendRawTransaction(signedHex)).resolves.toBe(result.txid);
+
+    const decoded = decodeTransaction(hexToBin(signedHex));
+    if (typeof decoded === 'string') throw new Error(decoded);
+    const stateOut = decoded.outputs.find(
+      (o) => o.token?.nft !== undefined && binToHex(o.token.category) === STATE_CAT,
+    );
+    expect(stateOut).toBeDefined();
+    const next = oracle.decodeCommitment(stateOut!.token!.nft!.commitment);
+    expect(next.amountNext).toBe(20n);
+    expect(next.periodNext).toBe(DAY);
   });
 
   it('voids the proposal when the rebuild finds no live covenant UTXO (intervening spend)', async () => {

@@ -18,6 +18,7 @@ import { ChallengeService } from '../src/auth/challenge.service.js';
 import { SessionService } from '../src/auth/session.service.js';
 import { AuthGuard } from '../src/auth/auth.guard.js';
 import { SubscriptionsController } from '../src/api/subscriptions.controller.js';
+import { DiscoveryService } from '../src/discovery/discovery.service.js';
 import { NotificationsController } from '../src/api/notifications.controller.js';
 import { WebhooksController } from '../src/api/webhooks.controller.js';
 import { AuthController } from '../src/api/auth.controller.js';
@@ -174,6 +175,7 @@ describe('REST API', () => {
         { provide: ChallengeService, useValue: challenges },
         { provide: SessionService, useValue: sessions },
         { provide: AuthGuard, useValue: guard },
+        { provide: DiscoveryService, useValue: { discover: async () => ({ tracked: false, reason: "test" }) } },
       ],
     }).compile();
 

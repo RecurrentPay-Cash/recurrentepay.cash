@@ -30,6 +30,7 @@ import { AutoCancelPolicyRepository } from './auto-cancel-policy.repository.js';
 import { NotificationRepository } from '../notifications/notification.repository.js';
 import { ScheduledCancelService } from '../cancel/scheduled-cancel.service.js';
 import { OffchainService } from '../offchain/offchain.service.js';
+import { DiscoveryService } from '../discovery/discovery.service.js';
 import { parseId } from './query-id.js';
 
 /** Filtering query (§ Subscription filtering — basic). */
@@ -54,6 +55,7 @@ export class SubscriptionsController {
     private readonly scheduledCancels: ScheduledCancelService,
     private readonly guard: AuthGuard,
     private readonly offchain: OffchainService,
+    private readonly discovery: DiscoveryService,
   ) {}
 
   /** The caller's subscriptions, with derived fields and basic filtering. */
@@ -175,6 +177,44 @@ export class SubscriptionsController {
     await this.requireParty(stateCategory, pkh);
     await this.scheduledCancels.revoke(stateCategory, pkh);
     return { revoked: true };
+  }
+
+  /**
+   * Track a subscription from its genesis transaction (the creation webhook).
+   *
+   * The creation path must capture the oracle pubkey for an oracle (BCH) sub: the
+   * commitment stores only `hash160(oraclePk)`, so `oraclePubkey` (hex, compressed)
+   * is supplied here and verified against the commitment's `oraclePkHash` by the
+   * discovery service (a mismatch refuses to track). Token subs ignore it.
+   */
+  @Post('discover')
+  async discover(
+    @Body()
+    body: {
+      txid?: string;
+      stateCategory?: string;
+      assetType?: string;
+      oraclePubkey?: string;
+    },
+  ) {
+    if (typeof body?.txid !== 'string' || !/^[0-9a-f]{64}$/i.test(body.txid)) {
+      throw new BadRequestException('txid must be a 64-char hex txid');
+    }
+    if (typeof body?.stateCategory !== 'string' || !/^[0-9a-f]{64}$/i.test(body.stateCategory)) {
+      throw new BadRequestException('stateCategory must be a 32-byte category hex');
+    }
+    if (body.assetType !== undefined && body.assetType !== 'token' && body.assetType !== 'oracle') {
+      throw new BadRequestException('assetType must be "token" or "oracle"');
+    }
+    if (body.oraclePubkey !== undefined && !/^[0-9a-f]{66}$/i.test(body.oraclePubkey)) {
+      throw new BadRequestException('oraclePubkey must be a 33-byte compressed pubkey hex');
+    }
+    return this.discovery.discover({
+      txid: body.txid.toLowerCase(),
+      stateCategory: body.stateCategory.toLowerCase(),
+      assetType: body.assetType as 'token' | 'oracle' | undefined,
+      oraclePubkey: body.oraclePubkey?.toLowerCase(),
+    });
   }
 
   /** Load a subscription the caller is a party to, or throw 404. */

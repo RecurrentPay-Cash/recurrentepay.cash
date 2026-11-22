@@ -36,10 +36,12 @@ import {
   type Unlocker,
 } from 'cashscript';
 import { binToHex, hexToBin, sha256 } from '@bitauth/libauth';
-import artifact from 'contracts/artifacts/token-subscription.artifact.js';
+import tokenArtifact from 'contracts/artifacts/token-subscription.artifact.js';
+import oracleArtifact from 'contracts/artifacts/oracle-subscription.artifact.js';
 import {
   decodeCommitment,
   encodeCommitment,
+  oracle,
   settle,
   toInternalCategory,
   SEED,
@@ -205,6 +207,18 @@ async function buildMutual(
   const feeRate = options.feeRate ?? 1;
   const covenantAddress = sub.covenantAddress();
 
+  // Oracle (BCH) subs are a single UTXO and use the oracle artifact. Only
+  // `modify` is supported here (the oracle `modify(newAmountNext, newPeriodNext)`
+  // signature matches the token one); `migrate` is refused upstream (see
+  // `MutualConsentService.propose`). Never build a token-script tx against an
+  // oracle covenant.
+  if (sub.assetType === 'oracle') {
+    if (fn !== 'modify') {
+      throw new Error(`${fn}: oracle subs use the oracle artifact (migrate is not supported)`);
+    }
+    return buildOracleModify(provider, sub, options, nextStateOf);
+  }
+
   const utxos = await provider.getUtxosForLockingBytecode(covenantAddress);
   const stateUtxo = utxos.find(
     (u) => u.token?.category === sub.stateCategory && u.token.nft !== undefined,
@@ -222,7 +236,7 @@ async function buildMutual(
     throw new Error(`${fn}: no co-created escrow for ${sub.stateCategory}`);
   }
 
-  const contract = new Contract(artifact, [toInternalCategory(sub.stateCategory)], {
+  const contract = new Contract(tokenArtifact, [toInternalCategory(sub.stateCategory)], {
     provider,
     contractType: 'p2sh32',
   });
@@ -372,6 +386,93 @@ async function buildMutual(
   tx.addBchChangeOutputIfNeeded({ to: initiatorLock, feeRate });
   const hex = tx.build();
   return { hex, txid: txidOf(hex), nextState, signableInputs };
+}
+
+/**
+ * Build the `modify` transaction for an **oracle** (BCH) sub: a single UTXO
+ * (state NFT + sats). The oracle covenant's `modify(newAmountNext, newPeriodNext)`
+ * matches the token signature, but the output layout differs — a single state
+ * output carrying the whole balance (no escrow, no funds output).
+ *
+ *   modify: 0 state (NFT + balance)
+ *
+ * Both parties must be present (the contract requires it). The relay holds no key.
+ */
+async function buildOracleModify(
+  provider: NetworkProvider,
+  sub: Subscription,
+  options: BuildMutualOptions,
+  nextStateOf: (state: SubscriptionState) => SubscriptionState,
+): Promise<BuiltMutual> {
+  const now = options.now;
+  const feeRate = options.feeRate ?? 1;
+  const covenantAddress = sub.covenantAddress();
+
+  const utxos = await provider.getUtxosForLockingBytecode(covenantAddress);
+  const stateUtxo = utxos.find(
+    (u) => u.token?.category === sub.stateCategory && u.token.nft !== undefined,
+  );
+  if (stateUtxo === undefined) throw new Error(`modify: no state UTXO for ${sub.stateCategory}`);
+
+  const state = oracle.decodeCommitment(hexToBin(stateUtxo.token!.nft!.commitment));
+  const balance = stateUtxo.satoshis;
+
+  const contract = new Contract(oracleArtifact, [toInternalCategory(sub.stateCategory)], {
+    provider,
+    contractType: 'p2sh32',
+  });
+  const unlock = contract.unlock as unknown as Record<string, (...a: unknown[]) => Unlocker>;
+
+  // The oracle `modify` writes `amountNext`/`periodNext`; `amount`/`period` are
+  // carried through unchanged. `nextStateOf` is the token-shaped patcher, so map
+  // it onto the oracle state explicitly.
+  const patched = nextStateOf(state as unknown as SubscriptionState);
+  const nextState: oracle.OracleState = {
+    ...state,
+    amountNext: patched.amountNext,
+    periodNext: patched.periodNext,
+  };
+
+  const covenantLock = hexToBin(contract.lockingBytecode);
+  const tx = new TransactionBuilder({ provider }).setLocktime(now);
+  tx.addInput(stateUtxo, unlock['modify']!(nextState.amountNext, BigInt(nextState.periodNext)));
+  tx.addOutput({
+    to: covenantLock,
+    amount: balance,
+    token: {
+      category: sub.stateCategory,
+      amount: 0n,
+      nft: { capability: 'mutable', commitment: binToHex(oracle.encodeCommitment(nextState)) },
+    },
+  });
+
+  // Both parties' presence inputs (unsigned placeholders; the client signs).
+  const initiatorLock = hexToBin(options.initiatorInput.lockingBytecode);
+  const counterpartyLock = hexToBin(options.counterpartyInput.lockingBytecode);
+  const initiatorIndex = tx.inputs.length;
+  tx.addInput(toSpendable(options.initiatorInput, initiatorLock), unlockPresence(options.initiatorInput));
+  const counterpartyIndex = tx.inputs.length;
+  tx.addInput(toSpendable(options.counterpartyInput, counterpartyLock), unlockPresence(options.counterpartyInput));
+  tx.addBchChangeOutputIfNeeded({ to: initiatorLock, feeRate });
+
+  const hex = tx.build();
+  return {
+    hex,
+    txid: txidOf(hex),
+    nextState: nextState as unknown as SubscriptionState,
+    signableInputs: [
+      {
+        index: initiatorIndex,
+        lockingBytecode: options.initiatorInput.lockingBytecode.toLowerCase(),
+        satoshis: options.initiatorInput.satoshis.toString(),
+      },
+      {
+        index: counterpartyIndex,
+        lockingBytecode: options.counterpartyInput.lockingBytecode.toLowerCase(),
+        satoshis: options.counterpartyInput.satoshis.toString(),
+      },
+    ],
+  };
 }
 
 /**

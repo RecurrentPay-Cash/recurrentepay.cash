@@ -37,8 +37,9 @@ import {
   type Unlocker,
 } from 'cashscript';
 import { binToHex, hexToBin, sha256 } from '@bitauth/libauth';
-import artifact from 'contracts/artifacts/token-subscription.artifact.js';
-import { decodeCommitment, deriveEscrow, settle, toInternalCategory, SEED } from 'shared';
+import tokenArtifact from 'contracts/artifacts/token-subscription.artifact.js';
+import oracleArtifact from 'contracts/artifacts/oracle-subscription.artifact.js';
+import { decodeCommitment, deriveEscrow, oracle, settle, toInternalCategory, SEED } from 'shared';
 import type { WatchedUtxo } from '../watcher/chain-watcher.js';
 import type { Subscription } from '../db/subscription.entity.js';
 import { CancelRepository } from './cancel.repository.js';
@@ -127,6 +128,12 @@ export class CancelExecutorService {
     const now = options.now;
     const feeRate = options.feeRate ?? 1;
     const covenantAddress = sub.covenantAddress();
+
+    // Oracle (BCH) subs are a single UTXO (state NFT + sats, no escrow) and the
+    // oracle covenant's `cancel` takes no oracle args — it prices at `lastRate`.
+    if (sub.assetType === 'oracle') {
+      return this.buildOracleCancel(sub, covenantAddress, now, feeRate);
+    }
 
     const utxos = await this.provider.getUtxosForLockingBytecode(covenantAddress);
     const stateUtxo = utxos.find(
@@ -322,8 +329,70 @@ export class CancelExecutorService {
     return { broadcast: true, txid, hex: built.hex };
   }
 
+  /**
+   * Build the cancel for an **oracle** (BCH) sub: a single UTXO (state NFT +
+   * sats). The oracle covenant's `cancel` takes **no oracle args** — it prices at
+   * the commitment's `lastRate` (the dead-oracle kill switch per design.md).
+   *
+   * Output layout (contract `cancel`):
+   *   [0 supportee, 1 service] if gross > 0, then refund (balance − gross), burn NFT.
+   * The state NFT is burned (no output may carry the state category).
+   */
+  private async buildOracleCancel(
+    sub: Subscription,
+    covenantAddress: string,
+    now: number,
+    feeRate: number,
+  ): Promise<BuiltCancel> {
+    const utxos = await this.provider.getUtxosForLockingBytecode(covenantAddress);
+    const stateUtxo = utxos.find(
+      (u) => u.token?.category === sub.stateCategory && u.token.nft !== undefined,
+    );
+    if (stateUtxo === undefined) throw new Error(`cancel: no state UTXO for ${sub.stateCategory}`);
+
+    const state = oracle.decodeCommitment(hexToBin(stateUtxo.token!.nft!.commitment));
+    const balance = stateUtxo.satoshis;
+    const settlement = oracle.settleOracle(state, balance - oracle.DUST, now, BigInt(state.lastRate));
+
+    // Gate on the boundary only (the oracle `cancel` has no `require(gross > 0)`).
+    if (now < state.lastPeriodTime + state.period) {
+      throw new Error(`cancel: boundary not reached for ${sub.stateCategory} at ${now}`);
+    }
+
+    const contract = this.contract(sub.stateCategory, 'oracle');
+    const unlock = contract.unlock as unknown as Record<string, () => Unlocker>;
+
+    const tx = new TransactionBuilder({ provider: this.provider }).setLocktime(now);
+    tx.addInput(stateUtxo, unlock['cancel']!());
+
+    const outputs: Output[] = [];
+    if (settlement.gross > 0n) {
+      outputs.push({ to: p2pkhLock(state.supporteePkh), amount: settlement.paid });
+      outputs.push({ to: p2pkhLock(state.servicePkh), amount: settlement.fee });
+    }
+    // Refund = balance − gross (the whole balance when m = 0). The state NFT is
+    // never routed out — it is burnt.
+    outputs.push({ to: p2pkhLock(state.supporterPkh), amount: balance - settlement.gross });
+    tx.addOutputs(outputs);
+
+    const serviceLock = this.serviceLock();
+    const serviceUtxo = await this.serviceUtxo(serviceLock);
+    tx.addInput(serviceUtxo, this.serviceTemplate().unlockP2PKH());
+    tx.addBchChangeOutputIfNeeded({ to: serviceLock, feeRate });
+
+    const hex = tx.build();
+    return {
+      hex,
+      txid: txidOf(hex),
+      gross: settlement.gross,
+      fee: settlement.fee,
+      swept: { strayFunds: 0n, foreignTokens: 0, bchOnly: 0n },
+    };
+  }
+
   /** The contract instance for a state category (display order in, internal arg). */
-  private contract(stateCategory: string): Contract {
+  private contract(stateCategory: string, assetType: 'token' | 'oracle' = 'token'): Contract {
+    const artifact = assetType === 'oracle' ? oracleArtifact : tokenArtifact;
     return new Contract(artifact, [toInternalCategory(stateCategory)], {
       provider: this.provider,
       contractType: 'p2sh32',

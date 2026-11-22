@@ -34,6 +34,7 @@ import { SessionService } from '../src/auth/session.service.js';
 import { AuthGuard } from '../src/auth/auth.guard.js';
 import { AuthController } from '../src/api/auth.controller.js';
 import { SubscriptionsController } from '../src/api/subscriptions.controller.js';
+import { DiscoveryService } from '../src/discovery/discovery.service.js';
 import { NotificationsController } from '../src/api/notifications.controller.js';
 import { WebhooksController } from '../src/api/webhooks.controller.js';
 import { AutoCancelPolicyRepository } from '../src/api/auto-cancel-policy.repository.js';
@@ -155,6 +156,7 @@ describe('Subscription filtering (channel / state / plan)', () => {
         { provide: ChallengeService, useValue: challenges },
         { provide: SessionService, useValue: sessions },
         { provide: AuthGuard, useValue: guard },
+        { provide: DiscoveryService, useValue: { discover: async () => ({ tracked: false, reason: "test" }) } },
       ],
     }).compile();
 
