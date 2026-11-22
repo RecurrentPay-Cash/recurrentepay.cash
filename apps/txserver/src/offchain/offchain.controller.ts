@@ -35,6 +35,7 @@ import {
 } from './offchain.service.js';
 import type { ChannelUpsert } from './channel.repository.js';
 import type { PlanUpsert } from './plan.repository.js';
+import type { ChannelPolicyView } from './channel-policy.repository.js';
 import { parseId } from '../api/query-id.js';
 import { SubscriptionRepository } from '../subscription/subscription.repository.js';
 
@@ -105,6 +106,31 @@ export class OffchainController {
     @Body() body: Partial<ChannelUpsert>,
   ): Promise<ChannelView> {
     return this.offchain.updateChannel(this.guard.caller(request), body);
+  }
+
+  /**
+   * The caller's effective channel auto-cancel policy (dapp-handoff §14). The web
+   * presents auto-cancel as a channel setting; this is the channel default that
+   * applies to all the creator's subs (a per-sub override still wins). Returns
+   * the disabled defaults when the channel has not set one. Owner-scoped.
+   */
+  @Get('channel/auto-cancel')
+  @UseGuards(AuthGuard)
+  async channelAutoCancelPolicy(@Req() request: AuthedRequest): Promise<ChannelPolicyView> {
+    return this.offchain.channelAutoCancelPolicy(this.guard.caller(request));
+  }
+
+  /**
+   * Set the caller's channel-level auto-cancel policy (dapp-handoff §14). The
+   * per-sub `POST /subscriptions/:id/auto-cancel-policy` stays for override/testing.
+   */
+  @Put('channel/auto-cancel')
+  @UseGuards(AuthGuard)
+  async setChannelAutoCancelPolicy(
+    @Req() request: AuthedRequest,
+    @Body() body: { thresholdPeriods?: number; graceSeconds?: number; enabled?: boolean },
+  ): Promise<ChannelPolicyView> {
+    return this.offchain.setChannelAutoCancelPolicy(this.guard.caller(request), body);
   }
 
   /** The caller's plans (visible only) — seeds the create wizard. */

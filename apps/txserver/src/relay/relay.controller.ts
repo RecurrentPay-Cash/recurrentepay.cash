@@ -106,8 +106,9 @@ export class RelayController {
 
   /**
    * The counterparty prepares: the relay rebuilds the tx against the current
-   * outpoints and returns the **unsigned** template + `signableInputs`. No
-   * broadcast — the client signs the presence inputs and calls `broadcast`.
+   * outpoints and returns the **unsigned** template + `signableInputs` +
+   * `sourceOutputs` (one per input, in tx order) for WizardConnect. No broadcast —
+   * the client signs the presence inputs and calls `broadcast`.
    */
   @Post('proposals/:id/prepare')
   async prepare(

@@ -32,6 +32,7 @@ import {
 import { Subscription } from '../src/db/subscription.entity.js';
 import { SubscriptionRepository } from '../src/subscription/subscription.repository.js';
 import { TokenActionsService } from '../src/pull/token-actions.service.js';
+import { p2pkhAddress } from '../src/relay/mutual-consent-builder.js';
 import { signPrepared } from './client-signer.js';
 
 const { hash160 } = utils;
@@ -199,10 +200,38 @@ describe('TokenActionsService', () => {
 
     const signed = signPrepared(built.hex, built.signableInputs, { [SUPPORTER_LOCK]: SUPPORTER_KEY });
     await expect(provider.sendRawTransaction(signed)).resolves.toMatch(/^[0-9a-f]{64}$/);
+
+    // `sourceOutputs` is positional: state NFT, escrow, supporter presence, service.
+    const decodedSources = decodeTransaction(hexToBin(built.hex));
+    if (typeof decodedSources === 'string') throw new Error(decodedSources);
+    expect(built.sourceOutputs).toHaveLength(decodedSources.inputs.length);
+    expect(built.sourceOutputs[0]).toMatchObject({
+      outpointTransactionHash: CO_TXID,
+      outpointIndex: 1,
+      unlockingBytecode: '',
+      valueSatoshis: COVENANT_SATS.toString(),
+      token: { category: STATE_CAT, nft: { capability: 'mutable' } },
+    });
+    expect(built.sourceOutputs[1]).toMatchObject({
+      outpointTransactionHash: CO_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: COVENANT_SATS.toString(),
+      token: { category: FUNDS_CAT },
+    });
+    expect(built.sourceOutputs[2]).toMatchObject({
+      outpointTransactionHash: SUPPORTER_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '1000000',
+    });
+    expect(built.signableInputs[0]).toMatchObject({
+      index: 2,
+      address: p2pkhAddress(SUPPORTER_LOCK),
+    });
   });
 
-  it('withdraw at n = 0 (gross = 0) uses the [state, funds, payout] layout and is VM-accepted', async () => {
-    const state = makeState();
+  it('withdraw at n = 0 (gross = 0) uses the [state, funds, payout] layout and is VM-accepted', async () => {    const state = makeState();
     seedChain(state, 101n);
     const now = T; // n = 0 → gross = 0
 

@@ -28,6 +28,8 @@ import { SubscriptionRepository } from '../subscription/subscription.repository.
 import { AuthGuard, type AuthedRequest } from '../auth/auth.guard.js';
 import { AutoCancelPolicyRepository } from './auto-cancel-policy.repository.js';
 import { NotificationRepository } from '../notifications/notification.repository.js';
+import { NotificationReadRepository } from '../notifications/notification-read.repository.js';
+import { toView as toNotificationView } from './notifications.controller.js';
 import { ScheduledCancelService } from '../cancel/scheduled-cancel.service.js';
 import { OffchainService } from '../offchain/offchain.service.js';
 import { DiscoveryService } from '../discovery/discovery.service.js';
@@ -54,6 +56,7 @@ export class SubscriptionsController {
     private readonly repository: SubscriptionRepository,
     private readonly policies: AutoCancelPolicyRepository,
     private readonly notifications: NotificationRepository,
+    private readonly notificationReads: NotificationReadRepository,
     private readonly scheduledCancels: ScheduledCancelService,
     private readonly guard: AuthGuard,
     private readonly offchain: OffchainService,
@@ -119,7 +122,12 @@ export class SubscriptionsController {
   ) {
     const pkh = this.guard.caller(request);
     await this.requireParty(stateCategory, pkh);
-    return this.notifications.findBySubscription(stateCategory, 100);
+    const rows = await this.notifications.findBySubscription(stateCategory, 100);
+    const readAt = await this.notificationReads.readAtByNotification(
+      rows.map((r) => r.id),
+      pkh,
+    );
+    return rows.map((row) => toNotificationView(row, readAt.get(row.id) ?? null));
   }
 
   /**
@@ -206,6 +214,7 @@ export class SubscriptionsController {
       stateCategory,
       unsignedHex: built.hex,
       signableInputs: built.signableInputs,
+      sourceOutputs: built.sourceOutputs,
       gross: built.gross.toString(),
       fee: built.fee.toString(),
       payout: built.payout.toString(),
@@ -258,6 +267,7 @@ export class SubscriptionsController {
       stateCategory,
       unsignedHex: built.hex,
       signableInputs: built.signableInputs,
+      sourceOutputs: built.sourceOutputs,
       supporteeAmount: built.supporteeAmount.toString(),
       fee: built.fee.toString(),
       newFunds: built.newFunds.toString(),
@@ -330,6 +340,7 @@ export class SubscriptionsController {
       mode,
       unsignedHex: built.hex,
       signableInputs: built.signableInputs,
+      sourceOutputs: built.sourceOutputs,
       newOraclePkHash: built.newOraclePkHash,
       gross: built.gross.toString(),
       fee: built.fee.toString(),
@@ -415,6 +426,7 @@ export class SubscriptionsController {
       stateCategory,
       unsignedHex: built.hex,
       signableInputs: built.signableInputs,
+      sourceOutputs: built.sourceOutputs,
       gross: built.gross.toString(),
       fee: built.fee.toString(),
       payout: built.payout.toString(),
@@ -463,6 +475,7 @@ export class SubscriptionsController {
       stateCategory,
       unsignedHex: built.hex,
       signableInputs: built.signableInputs,
+      sourceOutputs: built.sourceOutputs,
       supporteeAmount: built.supporteeAmount.toString(),
       fee: built.fee.toString(),
       newFunds: built.newFunds.toString(),
@@ -511,6 +524,7 @@ export class SubscriptionsController {
       stateCategory,
       unsignedHex: built.hex,
       signableInputs: built.signableInputs,
+      sourceOutputs: built.sourceOutputs,
       total: built.total.toString(),
     };
   }

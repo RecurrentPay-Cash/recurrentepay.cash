@@ -30,6 +30,7 @@ import {
 import { OracleClientService, type OracleHttpClient } from '../src/oracle/oracle-client.service.js';
 import { OracleMessageRepository } from '../src/oracle/oracle-message.repository.js';
 import { encodeGpMessageHex, gpMessageDigest } from '../src/oracle/gp-message.js';
+import { p2pkhAddress } from '../src/relay/mutual-consent-builder.js';
 import { signPrepared } from './client-signer.js';
 
 const { hash160: csHash160 } = utils;
@@ -296,15 +297,43 @@ describe('OracleActionsService — migrate', () => {
     expect(built.newOraclePkHash).toBe(NEW_ORACLE_PKH);
     expect(built.signableInputs).toHaveLength(2);
 
+    // `sourceOutputs` is positional: covenant state input, supporter input, supportee input.
+    const decodedPrepared = decodeTransaction(hexToBin(built.hex));
+    if (typeof decodedPrepared === 'string') throw new Error(decodedPrepared);
+    expect(built.sourceOutputs).toHaveLength(decodedPrepared.inputs.length);
+    expect(built.sourceOutputs[0]).toMatchObject({
+      outpointTransactionHash: CO_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '10000000',
+      token: { category: STATE_CAT, nft: { capability: 'mutable' } },
+    });
+    expect(built.sourceOutputs[1]).toMatchObject({
+      outpointTransactionHash: SUPPORTER_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '1000000',
+    });
+    expect(built.sourceOutputs[2]).toMatchObject({
+      outpointTransactionHash: SUPPORTEE_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '1000000',
+    });
+    expect(built.signableInputs.map((s) => s.address)).toEqual([
+      p2pkhAddress(SUPPORTER_LOCK),
+      p2pkhAddress(SUPPORTEE_LOCK),
+    ]);
+
     const signed = signPrepared(built.hex, built.signableInputs, {
       [SUPPORTER_LOCK]: SUPPORTER_KEY,
       [SUPPORTEE_LOCK]: SUPPORTEE_KEY,
     });
     await expect(provider.sendRawTransaction(signed)).resolves.toMatch(/^[0-9a-f]{64}$/);
 
-    const decoded = decodeTransaction(hexToBin(built.hex));
-    if (typeof decoded === 'string') throw new Error(decoded);
-    const stateOut = decoded.outputs[2]!;
+    const decodedSigned = decodeTransaction(hexToBin(built.hex));
+    if (typeof decodedSigned === 'string') throw new Error(decodedSigned);
+    const stateOut = decodedSigned.outputs[2]!;
     const next = oracle.decodeCommitment(stateOut.token!.nft!.commitment);
     expect(binToHex(next.oraclePkHash)).toBe(NEW_ORACLE_PKH);
     expect(next.lastRate).toBe(PRICE); // refreshed to the verified price

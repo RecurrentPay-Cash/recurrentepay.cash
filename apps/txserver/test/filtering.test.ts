@@ -18,6 +18,8 @@ import { Channel } from '../src/db/channel.entity.js';
 import { Plan } from '../src/db/plan.entity.js';
 import { SubscriptionLink } from '../src/db/subscription-link.entity.js';
 import { AutoCancelPolicy } from '../src/db/auto-cancel-policy.entity.js';
+import { ChannelAutoCancelPolicy } from '../src/db/channel-auto-cancel-policy.entity.js';
+import { NotificationRead } from '../src/db/notification-read.entity.js';
 import { Notification } from '../src/db/notification.entity.js';
 import { WebhookEndpoint } from '../src/db/webhook-endpoint.entity.js';
 import { Cancel } from '../src/db/cancel.entity.js';
@@ -27,6 +29,7 @@ import { AccountRepository } from '../src/offchain/account.repository.js';
 import { ChannelRepository } from '../src/offchain/channel.repository.js';
 import { PlanRepository } from '../src/offchain/plan.repository.js';
 import { SubscriptionLinkRepository } from '../src/offchain/subscription-link.repository.js';
+import { ChannelAutoCancelPolicyRepository } from '../src/offchain/channel-policy.repository.js';
 import { OffchainService } from '../src/offchain/offchain.service.js';
 import { OffchainController } from '../src/offchain/offchain.controller.js';
 import { ChallengeService } from '../src/auth/challenge.service.js';
@@ -41,6 +44,7 @@ import { NotificationsController } from '../src/api/notifications.controller.js'
 import { WebhooksController } from '../src/api/webhooks.controller.js';
 import { AutoCancelPolicyRepository } from '../src/api/auto-cancel-policy.repository.js';
 import { NotificationRepository } from '../src/notifications/notification.repository.js';
+import { NotificationReadRepository } from '../src/notifications/notification-read.repository.js';
 import { WebhookEndpointRepository } from '../src/notifications/webhook-endpoint.repository.js';
 import { CancelRepository } from '../src/cancel/cancel.repository.js';
 import { CancelExecutorService } from '../src/cancel/cancel-executor.service.js';
@@ -113,6 +117,8 @@ describe('Subscription filtering (channel / state / plan)', () => {
         WebhookEndpoint,
         Cancel,
         ScheduledCancel,
+        ChannelAutoCancelPolicy,
+        NotificationRead,
       ],
       synchronize: true,
     });
@@ -122,13 +128,22 @@ describe('Subscription filtering (channel / state / plan)', () => {
     const channels = new ChannelRepository(dataSource.getRepository(Channel));
     const plans = new PlanRepository(dataSource.getRepository(Plan));
     const links = new SubscriptionLinkRepository(dataSource.getRepository(SubscriptionLink));
-    offchain = new OffchainService(accounts, channels, plans, links);
+    offchain = new OffchainService(
+      accounts,
+      channels,
+      plans,
+      links,
+      new ChannelAutoCancelPolicyRepository(dataSource.getRepository(ChannelAutoCancelPolicy)),
+    );
 
     const challenges = new ChallengeService();
     const sessions = new SessionService(challenges);
     const guard = new AuthGuard(sessions);
     const policies = new AutoCancelPolicyRepository(dataSource.getRepository(AutoCancelPolicy));
     const notifications = new NotificationRepository(dataSource.getRepository(Notification));
+    const notificationReads = new NotificationReadRepository(
+      dataSource.getRepository(NotificationRead),
+    );
     const webhooks = new WebhookEndpointRepository(dataSource.getRepository(WebhookEndpoint));
     const cancels = new CancelRepository(dataSource.getRepository(Cancel));
     const cancelExecutor = new CancelExecutorService({} as never, cancels, repository, {});
@@ -153,6 +168,7 @@ describe('Subscription filtering (channel / state / plan)', () => {
         { provide: OffchainService, useValue: offchain },
         { provide: AutoCancelPolicyRepository, useValue: policies },
         { provide: NotificationRepository, useValue: notifications },
+        { provide: NotificationReadRepository, useValue: notificationReads },
         { provide: WebhookEndpointRepository, useValue: webhooks },
         { provide: ScheduledCancelService, useValue: scheduledCancels },
         { provide: ChallengeService, useValue: challenges },
@@ -201,6 +217,8 @@ describe('Subscription filtering (channel / state / plan)', () => {
       Notification,
       WebhookEndpoint,
       ScheduledCancel,
+      ChannelAutoCancelPolicy,
+      NotificationRead,
     ]) {
       await dataSource.getRepository(entity).clear();
     }

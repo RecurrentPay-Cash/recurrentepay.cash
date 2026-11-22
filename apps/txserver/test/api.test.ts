@@ -28,7 +28,9 @@ import { WebhookEndpointRepository } from '../src/notifications/webhook-endpoint
 import { AutoCancelPolicyRepository } from '../src/api/auto-cancel-policy.repository.js';
 import { AutoCancelPolicy } from '../src/db/auto-cancel-policy.entity.js';
 import { NotificationRepository } from '../src/notifications/notification.repository.js';
+import { NotificationReadRepository } from '../src/notifications/notification-read.repository.js';
 import { Notification } from '../src/db/notification.entity.js';
+import { NotificationRead } from '../src/db/notification-read.entity.js';
 import { WebhookEndpoint } from '../src/db/webhook-endpoint.entity.js';
 import { Cancel } from '../src/db/cancel.entity.js';
 import { ScheduledCancel } from '../src/db/scheduled-cancel.entity.js';
@@ -43,6 +45,8 @@ import { AccountRepository } from '../src/offchain/account.repository.js';
 import { ChannelRepository } from '../src/offchain/channel.repository.js';
 import { PlanRepository } from '../src/offchain/plan.repository.js';
 import { SubscriptionLinkRepository } from '../src/offchain/subscription-link.repository.js';
+import { ChannelAutoCancelPolicyRepository } from '../src/offchain/channel-policy.repository.js';
+import { ChannelAutoCancelPolicy } from '../src/db/channel-auto-cancel-policy.entity.js';
 import { OffchainService } from '../src/offchain/offchain.service.js';
 import { DAY, FUNDS_CAT, STATE_CAT, T } from './fixtures.js';
 
@@ -121,6 +125,7 @@ describe('REST API', () => {
         Subscription,
         AutoCancelPolicy,
         Notification,
+        NotificationRead,
         WebhookEndpoint,
         Cancel,
         ScheduledCancel,
@@ -128,6 +133,7 @@ describe('REST API', () => {
         Channel,
         Plan,
         SubscriptionLink,
+        ChannelAutoCancelPolicy,
       ],
       synchronize: true,
     });
@@ -137,6 +143,9 @@ describe('REST API', () => {
     const sessions = new SessionService(challenges);
     const policies = new AutoCancelPolicyRepository(dataSource.getRepository(AutoCancelPolicy));
     const notifications = new NotificationRepository(dataSource.getRepository(Notification));
+    const notificationReads = new NotificationReadRepository(
+      dataSource.getRepository(NotificationRead),
+    );
     const webhooks = new WebhookEndpointRepository(dataSource.getRepository(WebhookEndpoint));
     const guard = new AuthGuard(sessions);
     const cancels = new CancelRepository(dataSource.getRepository(Cancel));
@@ -157,6 +166,7 @@ describe('REST API', () => {
       new ChannelRepository(dataSource.getRepository(Channel)),
       new PlanRepository(dataSource.getRepository(Plan)),
       new SubscriptionLinkRepository(dataSource.getRepository(SubscriptionLink)),
+      new ChannelAutoCancelPolicyRepository(dataSource.getRepository(ChannelAutoCancelPolicy)),
     );
 
     const moduleRef = await Test.createTestingModule({
@@ -171,6 +181,7 @@ describe('REST API', () => {
         { provide: SubscriptionRepository, useValue: repository },
         { provide: AutoCancelPolicyRepository, useValue: policies },
         { provide: NotificationRepository, useValue: notifications },
+        { provide: NotificationReadRepository, useValue: notificationReads },
         { provide: WebhookEndpointRepository, useValue: webhooks },
         { provide: ScheduledCancelService, useValue: scheduledCancels },
         { provide: OffchainService, useValue: offchain },
@@ -196,6 +207,7 @@ describe('REST API', () => {
     await dataSource.getRepository(Subscription).clear();
     await dataSource.getRepository(AutoCancelPolicy).clear();
     await dataSource.getRepository(Notification).clear();
+    await dataSource.getRepository(NotificationRead).clear();
     await dataSource.getRepository(WebhookEndpoint).clear();
     await dataSource.getRepository(ScheduledCancel).clear();
     await dataSource.getRepository(SubscriptionLink).clear();

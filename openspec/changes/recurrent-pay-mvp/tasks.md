@@ -309,7 +309,14 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
   `notifications.test.ts` (persist-before-deliver, signed body, retry, dedupe,
   attempts recorded, same-second distinct events, DB-level unique-key constraint),
   `rate-limit.test.ts` (sliding window + 429), `migrations.test.ts` (up/down
-  round-trip)
+  round-trip) — **Slice 8 (0-conf transitions):** `TransitionDetector`
+  (`src/subscription/transition-detector.ts`) classifies a covenant spend as
+  `fund_success` / `withdraw_success` / `reactivate_success` from the **spending
+  tx's outputs** (the args are empty under presence-auth), diffed against the
+  previous derived row; `DiscoveryService.onChainChange` emits it via
+  `NotificationService` (persist-before-deliver, idempotent). Tests:
+  `transition-notifications.test.ts` (fund/withdraw/reactivate classification, a
+  plain pull emits nothing, idempotent re-derive, end-to-end emit+persist).
 - [x] 8.14 **DB schema** — subscription, pull, notification, webhook_endpoint, auto_cancel_policy,
   scheduled_cancel, oracle_message, account, channel, plan, subscription_link,
   mutual_consent_proposal (migrations; derived values are caches)  — **Slice 1:** only the `subscription` table (derived-state cache) + migration tooling; remaining

@@ -30,6 +30,10 @@ import { AccountRepository } from '../src/offchain/account.repository.js';
 import { ChannelRepository } from '../src/offchain/channel.repository.js';
 import { PlanRepository } from '../src/offchain/plan.repository.js';
 import { SubscriptionLinkRepository } from '../src/offchain/subscription-link.repository.js';
+import { ChannelAutoCancelPolicyRepository } from '../src/offchain/channel-policy.repository.js';
+import { ChannelAutoCancelPolicy } from '../src/db/channel-auto-cancel-policy.entity.js';
+import { NotificationRead } from '../src/db/notification-read.entity.js';
+import { NotificationReadRepository } from '../src/notifications/notification-read.repository.js';
 import { OffchainService } from '../src/offchain/offchain.service.js';
 import { OffchainController } from '../src/offchain/offchain.controller.js';
 import { ChallengeService } from '../src/auth/challenge.service.js';
@@ -127,6 +131,8 @@ describe('Off-chain channel/plan CRUD', () => {
         WebhookEndpoint,
         Cancel,
         ScheduledCancel,
+        ChannelAutoCancelPolicy,
+        NotificationRead,
       ],
       synchronize: true,
     });
@@ -136,13 +142,19 @@ describe('Off-chain channel/plan CRUD', () => {
     const channels = new ChannelRepository(dataSource.getRepository(Channel));
     const plans = new PlanRepository(dataSource.getRepository(Plan));
     const links = new SubscriptionLinkRepository(dataSource.getRepository(SubscriptionLink));
-    const offchain = new OffchainService(accounts, channels, plans, links);
+    const channelPolicies = new ChannelAutoCancelPolicyRepository(
+      dataSource.getRepository(ChannelAutoCancelPolicy),
+    );
+    const offchain = new OffchainService(accounts, channels, plans, links, channelPolicies);
 
     const challenges = new ChallengeService();
     const sessions = new SessionService(challenges);
     const guard = new AuthGuard(sessions);
     const policies = new AutoCancelPolicyRepository(dataSource.getRepository(AutoCancelPolicy));
     const notifications = new NotificationRepository(dataSource.getRepository(Notification));
+    const notificationReads = new NotificationReadRepository(
+      dataSource.getRepository(NotificationRead),
+    );
     const webhooks = new WebhookEndpointRepository(dataSource.getRepository(WebhookEndpoint));
     const cancels = new CancelRepository(dataSource.getRepository(Cancel));
     const cancelExecutor = new CancelExecutorService({} as never, cancels, repository, {});
@@ -168,6 +180,7 @@ describe('Off-chain channel/plan CRUD', () => {
         { provide: SubscriptionLinkRepository, useValue: links },
         { provide: AutoCancelPolicyRepository, useValue: policies },
         { provide: NotificationRepository, useValue: notifications },
+        { provide: NotificationReadRepository, useValue: notificationReads },
         { provide: WebhookEndpointRepository, useValue: webhooks },
         { provide: ScheduledCancelService, useValue: scheduledCancels },
         { provide: ChallengeService, useValue: challenges },
@@ -199,6 +212,8 @@ describe('Off-chain channel/plan CRUD', () => {
       Notification,
       WebhookEndpoint,
       ScheduledCancel,
+      ChannelAutoCancelPolicy,
+      NotificationRead,
     ]) {
       await dataSource.getRepository(entity).clear();
     }

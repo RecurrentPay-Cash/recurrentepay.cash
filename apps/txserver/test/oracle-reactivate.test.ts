@@ -20,6 +20,7 @@ import { OracleActionsService, OracleActionDeferredError } from '../src/pull/ora
 import { OracleClientService, type OracleHttpClient } from '../src/oracle/oracle-client.service.js';
 import { OracleMessageRepository } from '../src/oracle/oracle-message.repository.js';
 import { encodeGpMessageHex, gpMessageDigest } from '../src/oracle/gp-message.js';
+import { p2pkhAddress } from '../src/relay/mutual-consent-builder.js';
 import { signPrepared } from './client-signer.js';
 
 const { hash160: csHash160 } = utils;
@@ -230,6 +231,26 @@ describe('OracleActionsService — reactivate', () => {
     const decoded = decodeTransaction(hexToBin(built.hex));
     if (typeof decoded === 'string') throw new Error(decoded);
     expect(decoded.locktime).toBe(T + DAY);
+
+    // `sourceOutputs` is positional: covenant state input, funder input, service input.
+    expect(built.sourceOutputs).toHaveLength(decoded.inputs.length);
+    expect(built.sourceOutputs[0]).toMatchObject({
+      outpointTransactionHash: CO_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '2000',
+      token: { category: STATE_CAT, nft: { capability: 'mutable' } },
+    });
+    expect(built.sourceOutputs[1]).toMatchObject({
+      outpointTransactionHash: FUNDER_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '1000000',
+    });
+    expect(built.signableInputs[0]).toMatchObject({
+      index: 1,
+      address: p2pkhAddress(SUPPORTER_LOCK),
+    });
 
     const signed = signPrepared(built.hex, built.signableInputs, { [SUPPORTER_LOCK]: SUPPORTER_KEY });
     await expect(provider.sendRawTransaction(signed)).resolves.toMatch(/^[0-9a-f]{64}$/);

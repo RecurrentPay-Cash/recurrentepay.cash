@@ -12,6 +12,11 @@ import { AccountRepository } from './account.repository.js';
 import { ChannelRepository, type ChannelUpsert } from './channel.repository.js';
 import { PlanRepository, type PlanUpsert } from './plan.repository.js';
 import { SubscriptionLinkRepository } from './subscription-link.repository.js';
+import {
+  ChannelAutoCancelPolicyRepository,
+  DEFAULT_CHANNEL_POLICY,
+  type ChannelPolicyView,
+} from './channel-policy.repository.js';
 
 /** A creator's channel + its plans, as the API exposes them. */
 export interface ChannelView {
@@ -70,6 +75,7 @@ export class OffchainService {
     private readonly channels: ChannelRepository,
     private readonly plans: PlanRepository,
     private readonly links: SubscriptionLinkRepository,
+    private readonly channelPolicies: ChannelAutoCancelPolicyRepository,
   ) {}
 
   /**
@@ -123,6 +129,47 @@ export class OffchainService {
     if (body.defaultMode !== undefined) patch.defaultMode = normalizeMode(body.defaultMode);
     const updated = await this.channels.update(channel.id, patch);
     return this.toChannelView(updated);
+  }
+
+  /**
+   * The caller's effective channel auto-cancel policy (dapp-handoff §14): the
+   * stored channel default, or the disabled defaults when unset. Owner-scoped —
+   * a caller with no channel is a 403.
+   */
+  async channelAutoCancelPolicy(pkh: string): Promise<ChannelPolicyView> {
+    const channel = await this.requireOwnChannel(pkh);
+    const row = await this.channelPolicies.find(channel.id);
+    if (row === null) return { ...DEFAULT_CHANNEL_POLICY };
+    return {
+      thresholdPeriods: row.thresholdPeriods,
+      graceSeconds: row.graceSeconds,
+      enabled: row.enabled,
+    };
+  }
+
+  /**
+   * Set the caller's channel-level default auto-cancel policy (dapp-handoff §14).
+   * Validates the values (positive threshold, non-negative grace) and upserts the
+   * one row for the channel. Owner-scoped.
+   */
+  async setChannelAutoCancelPolicy(
+    pkh: string,
+    body: { thresholdPeriods?: unknown; graceSeconds?: unknown; enabled?: unknown },
+  ): Promise<ChannelPolicyView> {
+    const channel = await this.requireOwnChannel(pkh);
+    const thresholdPeriods = requirePositiveInt(body?.thresholdPeriods, 'thresholdPeriods');
+    const graceSeconds = requireNonNegativeInt(body?.graceSeconds, 'graceSeconds');
+    const row = await this.channelPolicies.upsert({
+      channelId: channel.id,
+      thresholdPeriods,
+      graceSeconds,
+      enabled: body?.enabled === undefined ? true : Boolean(body.enabled),
+    });
+    return {
+      thresholdPeriods: row.thresholdPeriods,
+      graceSeconds: row.graceSeconds,
+      enabled: row.enabled,
+    };
   }
 
   /** Add a plan to the caller's channel. */
@@ -379,6 +426,24 @@ function requirePeriod(value: unknown): number {
     throw new BadRequestException('period must be a positive integer');
   }
   return period;
+}
+
+/** A positive integer (channel auto-cancel `thresholdPeriods`). */
+function requirePositiveInt(value: unknown, field: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new BadRequestException(`${field} must be a positive integer`);
+  }
+  return parsed;
+}
+
+/** A non-negative integer (channel auto-cancel `graceSeconds`). */
+function requireNonNegativeInt(value: unknown, field: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new BadRequestException(`${field} must be a non-negative integer`);
+  }
+  return parsed;
 }
 
 /**

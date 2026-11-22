@@ -22,7 +22,7 @@ import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { DataSource } from 'typeorm';
 import request from 'supertest';
-import { binToHex, hexToBin, secp256k1, sha256 } from '@bitauth/libauth';
+import { binToHex, decodeTransaction, hexToBin, secp256k1, sha256 } from '@bitauth/libauth';
 import { MockNetworkProvider, SignatureTemplate, utils } from 'cashscript';
 import artifact from 'contracts/artifacts/oracle-subscription.artifact.js';
 import { covenantLockingBytecode, oracle, reverseCategory } from 'shared';
@@ -37,6 +37,8 @@ import { Account } from '../src/db/account.entity.js';
 import { Channel } from '../src/db/channel.entity.js';
 import { Plan } from '../src/db/plan.entity.js';
 import { SubscriptionLink } from '../src/db/subscription-link.entity.js';
+import { ChannelAutoCancelPolicy } from '../src/db/channel-auto-cancel-policy.entity.js';
+import { NotificationRead } from '../src/db/notification-read.entity.js';
 import { SubscriptionRepository } from '../src/subscription/subscription.repository.js';
 import { OracleMessageRepository } from '../src/oracle/oracle-message.repository.js';
 import { OracleClientService, type OracleHttpClient } from '../src/oracle/oracle-client.service.js';
@@ -58,6 +60,8 @@ import { AccountRepository } from '../src/offchain/account.repository.js';
 import { ChannelRepository } from '../src/offchain/channel.repository.js';
 import { PlanRepository } from '../src/offchain/plan.repository.js';
 import { SubscriptionLinkRepository } from '../src/offchain/subscription-link.repository.js';
+import { ChannelAutoCancelPolicyRepository } from '../src/offchain/channel-policy.repository.js';
+import { NotificationReadRepository } from '../src/notifications/notification-read.repository.js';
 import { DiscoveryService } from '../src/discovery/discovery.service.js';
 import { encodeGpMessageHex, gpMessageDigest } from '../src/oracle/gp-message.js';
 import { signPrepared } from './client-signer.js';
@@ -255,6 +259,8 @@ describe('Oracle actions API', () => {
         Channel,
         Plan,
         SubscriptionLink,
+        ChannelAutoCancelPolicy,
+        NotificationRead,
       ],
       synchronize: true,
     });
@@ -300,6 +306,10 @@ describe('Oracle actions API', () => {
       new ChannelRepository(dataSource.getRepository(Channel)),
       new PlanRepository(dataSource.getRepository(Plan)),
       new SubscriptionLinkRepository(dataSource.getRepository(SubscriptionLink)),
+      new ChannelAutoCancelPolicyRepository(dataSource.getRepository(ChannelAutoCancelPolicy)),
+    );
+    const notificationReads = new NotificationReadRepository(
+      dataSource.getRepository(NotificationRead),
     );
 
     const moduleRef = await Test.createTestingModule({
@@ -308,6 +318,7 @@ describe('Oracle actions API', () => {
         { provide: SubscriptionRepository, useValue: repository },
         { provide: AutoCancelPolicyRepository, useValue: policies },
         { provide: NotificationRepository, useValue: notifications },
+        { provide: NotificationReadRepository, useValue: notificationReads },
         { provide: WebhookEndpointRepository, useValue: webhooks },
         { provide: ScheduledCancelService, useValue: scheduledCancels },
         { provide: OffchainService, useValue: offchain },
@@ -345,6 +356,7 @@ describe('Oracle actions API', () => {
     await dataSource.getRepository(Plan).clear();
     await dataSource.getRepository(Channel).clear();
     await dataSource.getRepository(Account).clear();
+    await dataSource.getRepository(NotificationRead).clear();
     provider.reset();
 
     // Count broadcasts without jest globals: wrap the provider method for the
@@ -477,9 +489,30 @@ describe('Oracle actions API', () => {
     expect(res.body.signableInputs[0]).toMatchObject({
       lockingBytecode: SUPPORTER_LOCK,
       satoshis: '1000000',
+      address: 'bchtest:qr78y59zz80dm3cwuk388r097pupwdguaugjl6473v',
     });
     // The server never broadcasts an unsigned tx.
     expect(broadcastCount).toBe(0);
+
+    // `sourceOutputs` is positional — one per tx input, in tx order. The covenant
+    // input (state NFT + sats) is first; the supporter presence input is second.
+    const decoded = decodeTransaction(hexToBin(res.body.unsignedHex));
+    if (typeof decoded === 'string') throw new Error(decoded);
+    expect(res.body.sourceOutputs).toHaveLength(decoded.inputs.length);
+    expect(res.body.sourceOutputs[0]).toMatchObject({
+      outpointTransactionHash: CO_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '100000000',
+    });
+    expect(res.body.sourceOutputs[0].token.category).toBe(STATE_CAT);
+    expect(res.body.sourceOutputs[0].token.nft.capability).toBe('mutable');
+    expect(res.body.sourceOutputs[1]).toMatchObject({
+      outpointTransactionHash: SUPPORTER_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '1000000',
+    });
 
     // The unsigned hex is a template, not a valid tx: the placeholder presence
     // input has an empty signature, so the VM rejects it.
@@ -578,6 +611,27 @@ describe('Oracle actions API', () => {
 
     expect(prepared.body.unsignedHex).toMatch(/^[0-9a-f]+$/);
     expect(prepared.body.signableInputs.length).toBeGreaterThanOrEqual(1);
+    expect(prepared.body.signableInputs[0].address).toBe(
+      'bchtest:qr78y59zz80dm3cwuk388r097pupwdguaugjl6473v',
+    );
+
+    // `sourceOutputs` is positional: covenant state input, funder input, service input.
+    const decoded = decodeTransaction(hexToBin(prepared.body.unsignedHex));
+    if (typeof decoded === 'string') throw new Error(decoded);
+    expect(prepared.body.sourceOutputs).toHaveLength(decoded.inputs.length);
+    expect(prepared.body.sourceOutputs[0]).toMatchObject({
+      outpointTransactionHash: CO_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '2000',
+    });
+    expect(prepared.body.sourceOutputs[0].token.category).toBe(STATE_CAT);
+    expect(prepared.body.sourceOutputs[1]).toMatchObject({
+      outpointTransactionHash: SUPPORTER_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '1000000',
+    });
 
     const signed = signPrepared(prepared.body.unsignedHex, prepared.body.signableInputs, {
       [SUPPORTER_LOCK]: SUPPORTER_KEY,
@@ -612,6 +666,34 @@ describe('Oracle actions API', () => {
     expect(res.body.mode).toBe('mutual');
     expect(res.body.unsignedHex).toMatch(/^[0-9a-f]+$/);
     expect(res.body.signableInputs).toHaveLength(2);
+    // Each signable input carries the P2PKH address (the dapp maps it to an HD index).
+    expect(res.body.signableInputs.map((s: { address: string }) => s.address)).toEqual([
+      'bchtest:qr78y59zz80dm3cwuk388r097pupwdguaugjl6473v',
+      'bchtest:qpf3yc929gveug5v2d7l5skg904zclqlf5srkkj6wf',
+    ]);
+    // `sourceOutputs` is positional: covenant state input, then the two presence inputs.
+    const decoded = decodeTransaction(hexToBin(res.body.unsignedHex));
+    if (typeof decoded === 'string') throw new Error(decoded);
+    expect(res.body.sourceOutputs).toHaveLength(decoded.inputs.length);
+    expect(res.body.sourceOutputs[0]).toMatchObject({
+      outpointTransactionHash: CO_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '10000000',
+    });
+    expect(res.body.sourceOutputs[0].token.category).toBe(STATE_CAT);
+    expect(res.body.sourceOutputs[1]).toMatchObject({
+      outpointTransactionHash: SUPPORTER_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '1000000',
+    });
+    expect(res.body.sourceOutputs[2]).toMatchObject({
+      outpointTransactionHash: SUPPORTEE_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '1000000',
+    });
     expect(res.body.newOraclePkHash).toBe(NEW_ORACLE_PKH);
   });
 

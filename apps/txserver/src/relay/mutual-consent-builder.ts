@@ -35,7 +35,7 @@ import {
   type SpendableUtxo,
   type Unlocker,
 } from 'cashscript';
-import { binToHex, hexToBin, sha256 } from '@bitauth/libauth';
+import { binToHex, hexToBin, lockingBytecodeToCashAddress, sha256 } from '@bitauth/libauth';
 import tokenArtifact from 'contracts/artifacts/token-subscription.artifact.js';
 import oracleArtifact from 'contracts/artifacts/oracle-subscription.artifact.js';
 import {
@@ -114,10 +114,73 @@ export interface SignableInput {
   /** The input's satoshis (decimal string; the signing serialization's value). */
   satoshis: string;
   /**
+   * The input's P2PKH CashAddress (chipnet prefix). The server knows only the
+   * address, not the wallet's HD index, so the dapp maps it to an
+   * `inputPaths: [[index, "receive", addressIndex]]` entry itself.
+   */
+  address: string;
+  /**
    * The input's token (category hex display order + amount), when it carries one.
    * A `migrate` funding input does; the signing serialization commits to it.
    */
   token?: { category: string; amount: string };
+}
+
+/**
+ * A source output as WizardConnect's `signTransaction` expects it (positional,
+ * one per tx input in tx order). `unlockingBytecode` is empty: the wallet ignores
+ * it for signing and fills the real unlock script itself.
+ */
+export interface SourceOutput {
+  /** Outpoint txid (display order, 64 hex chars). */
+  outpointTransactionHash: string;
+  /** Output index within the previous transaction. */
+  outpointIndex: number;
+  /** Unlocking bytecode (empty for an unsigned source). */
+  unlockingBytecode: string;
+  /** Satoshis (decimal string). */
+  valueSatoshis: string;
+  /** Token contents, when the source carries one. */
+  token?: {
+    category: string;
+    amount: string;
+    nft?: { capability: 'none' | 'mutable' | 'minting'; commitment: string };
+  };
+}
+
+/** The CashAddress prefix the txserver encodes for display (testnet/chipnet). */
+const CASH_ADDRESS_PREFIX = 'bchtest';
+
+/** Encode a P2PKH locking bytecode as a CashAddress, falling back to the raw hex. */
+export function p2pkhAddress(lockingBytecode: string): string {
+  const result = lockingBytecodeToCashAddress({
+    bytecode: hexToBin(lockingBytecode),
+    prefix: CASH_ADDRESS_PREFIX,
+  });
+  return typeof result === 'string' ? lockingBytecode : result.address;
+}
+
+/**
+ * Map a builder's assembled inputs to the positional `sourceOutputs` array
+ * WizardConnect needs (one entry per input, in tx order). The builder has each
+ * input's outpoint + value + token; this is the only place that shape is derived.
+ */
+export function sourceOutputsOf(
+  inputs: readonly { txid: string; vout: number; satoshis: bigint; token?: { category: string; amount: bigint; nft?: { capability: 'none' | 'mutable' | 'minting'; commitment: string } } }[],
+): SourceOutput[] {
+  return inputs.map((input) => ({
+    outpointTransactionHash: input.txid,
+    outpointIndex: input.vout,
+    unlockingBytecode: '',
+    valueSatoshis: input.satoshis.toString(),
+    ...(input.token !== undefined && {
+      token: {
+        category: input.token.category,
+        amount: input.token.amount.toString(),
+        ...(input.token.nft !== undefined && { nft: input.token.nft }),
+      },
+    }),
+  }));
 }
 
 export interface BuiltMutual {
@@ -133,6 +196,8 @@ export interface BuiltMutual {
   nextState: SubscriptionState;
   /** The presence/funding inputs the client must sign (P2PKH). */
   signableInputs: SignableInput[];
+  /** Positional source outputs (one per tx input, in tx order). */
+  sourceOutputs: SourceOutput[];
 }
 
 /**
@@ -354,6 +419,7 @@ async function buildMutual(
         index,
         lockingBytecode: funding.lockingBytecode.toLowerCase(),
         satoshis: funding.satoshis.toString(),
+        address: p2pkhAddress(funding.lockingBytecode),
         token: { category: funding.category.toLowerCase(), amount: funding.amount.toString() },
       });
     }
@@ -378,16 +444,18 @@ async function buildMutual(
       index: initiatorIndex,
       lockingBytecode: options.initiatorInput.lockingBytecode.toLowerCase(),
       satoshis: options.initiatorInput.satoshis.toString(),
+      address: p2pkhAddress(options.initiatorInput.lockingBytecode),
     },
     {
       index: counterpartyIndex,
       lockingBytecode: options.counterpartyInput.lockingBytecode.toLowerCase(),
       satoshis: options.counterpartyInput.satoshis.toString(),
+      address: p2pkhAddress(options.counterpartyInput.lockingBytecode),
     },
   );
   tx.addBchChangeOutputIfNeeded({ to: initiatorLock, feeRate });
   const hex = tx.build();
-  return { hex, txid: txidOf(hex), nextState, signableInputs };
+  return { hex, txid: txidOf(hex), nextState, signableInputs, sourceOutputs: sourceOutputsOf(tx.inputs) };
 }
 
 /**
@@ -467,13 +535,16 @@ async function buildOracleModify(
         index: initiatorIndex,
         lockingBytecode: options.initiatorInput.lockingBytecode.toLowerCase(),
         satoshis: options.initiatorInput.satoshis.toString(),
+        address: p2pkhAddress(options.initiatorInput.lockingBytecode),
       },
       {
         index: counterpartyIndex,
         lockingBytecode: options.counterpartyInput.lockingBytecode.toLowerCase(),
         satoshis: options.counterpartyInput.satoshis.toString(),
+        address: p2pkhAddress(options.counterpartyInput.lockingBytecode),
       },
     ],
+    sourceOutputs: sourceOutputsOf(tx.inputs),
   };
 }
 

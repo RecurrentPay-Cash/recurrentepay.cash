@@ -30,6 +30,7 @@ import {
 import { OracleClientService, type OracleHttpClient } from '../src/oracle/oracle-client.service.js';
 import { OracleMessageRepository } from '../src/oracle/oracle-message.repository.js';
 import { encodeGpMessageHex, gpMessageDigest } from '../src/oracle/gp-message.js';
+import { p2pkhAddress } from '../src/relay/mutual-consent-builder.js';
 import { signPrepared } from './client-signer.js';
 
 const { hash160: csHash160 } = utils;
@@ -262,6 +263,28 @@ describe('OracleActionsService — withdraw', () => {
       makeRow({ amount: '100', amountNext: '100' }),
       { now: T + DAY, supporterInput: supporterInput() },
     );
+    // `sourceOutputs` is positional — one per tx input, in tx order. The covenant
+    // state input is first; the supporter presence input follows.
+    const decoded = decodeTransaction(hexToBin(built.hex));
+    if (typeof decoded === 'string') throw new Error(decoded);
+    expect(built.sourceOutputs).toHaveLength(decoded.inputs.length);
+    expect(built.sourceOutputs[0]).toMatchObject({
+      outpointTransactionHash: CO_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '10000000',
+      token: { category: STATE_CAT, nft: { capability: 'mutable' } },
+    });
+    expect(built.sourceOutputs[1]).toMatchObject({
+      outpointTransactionHash: SUPPORTER_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '1000000',
+    });
+    expect(built.signableInputs[0]).toMatchObject({
+      index: 1,
+      address: p2pkhAddress(SUPPORTER_LOCK),
+    });
     // The supporter signs their own presence input client-side (the relay holds no
     // key); the service key already signed its fee input.
     const signed = signPrepared(built.hex, built.signableInputs, { [SUPPORTER_LOCK]: SUPPORTER_KEY });

@@ -19,7 +19,7 @@ import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { DataSource } from 'typeorm';
 import request from 'supertest';
-import { binToHex, hexToBin, secp256k1, sha256 } from '@bitauth/libauth';
+import { binToHex, decodeTransaction, hexToBin, secp256k1, sha256 } from '@bitauth/libauth';
 import { MockNetworkProvider, SignatureTemplate, utils } from 'cashscript';
 import artifact from 'contracts/artifacts/token-subscription.artifact.js';
 import {
@@ -38,6 +38,9 @@ import { Account } from '../src/db/account.entity.js';
 import { Channel } from '../src/db/channel.entity.js';
 import { Plan } from '../src/db/plan.entity.js';
 import { SubscriptionLink } from '../src/db/subscription-link.entity.js';
+import { ChannelAutoCancelPolicy } from '../src/db/channel-auto-cancel-policy.entity.js';
+import { NotificationRead } from '../src/db/notification-read.entity.js';
+import { NotificationReadRepository } from '../src/notifications/notification-read.repository.js';
 import { SubscriptionRepository } from '../src/subscription/subscription.repository.js';
 import { TokenActionsService } from '../src/pull/token-actions.service.js';
 import { OracleActionsService } from '../src/pull/oracle-actions.service.js';
@@ -57,6 +60,7 @@ import { AccountRepository } from '../src/offchain/account.repository.js';
 import { ChannelRepository } from '../src/offchain/channel.repository.js';
 import { PlanRepository } from '../src/offchain/plan.repository.js';
 import { SubscriptionLinkRepository } from '../src/offchain/subscription-link.repository.js';
+import { ChannelAutoCancelPolicyRepository } from '../src/offchain/channel-policy.repository.js';
 import { DiscoveryService } from '../src/discovery/discovery.service.js';
 import { signPrepared } from './client-signer.js';
 
@@ -218,6 +222,8 @@ describe('Token actions API', () => {
         Channel,
         Plan,
         SubscriptionLink,
+        ChannelAutoCancelPolicy,
+        NotificationRead,
       ],
       synchronize: true,
     });
@@ -249,6 +255,10 @@ describe('Token actions API', () => {
       new ChannelRepository(dataSource.getRepository(Channel)),
       new PlanRepository(dataSource.getRepository(Plan)),
       new SubscriptionLinkRepository(dataSource.getRepository(SubscriptionLink)),
+      new ChannelAutoCancelPolicyRepository(dataSource.getRepository(ChannelAutoCancelPolicy)),
+    );
+    const notificationReads = new NotificationReadRepository(
+      dataSource.getRepository(NotificationRead),
     );
 
     const moduleRef = await Test.createTestingModule({
@@ -257,6 +267,7 @@ describe('Token actions API', () => {
         { provide: SubscriptionRepository, useValue: repository },
         { provide: AutoCancelPolicyRepository, useValue: policies },
         { provide: NotificationRepository, useValue: notifications },
+        { provide: NotificationReadRepository, useValue: notificationReads },
         { provide: WebhookEndpointRepository, useValue: webhooks },
         { provide: ScheduledCancelService, useValue: scheduledCancels },
         { provide: OffchainService, useValue: offchain },
@@ -293,6 +304,7 @@ describe('Token actions API', () => {
     await dataSource.getRepository(Plan).clear();
     await dataSource.getRepository(Channel).clear();
     await dataSource.getRepository(Account).clear();
+    await dataSource.getRepository(NotificationRead).clear();
     provider.reset();
 
     broadcastCount = 0;
@@ -359,8 +371,35 @@ describe('Token actions API', () => {
     expect(res.body.signableInputs[0]).toMatchObject({
       lockingBytecode: SUPPORTER_LOCK,
       satoshis: '1000000',
+      address: 'bchtest:qr78y59zz80dm3cwuk388r097pupwdguaugjl6473v',
     });
     expect(broadcastCount).toBe(0);
+
+    // `sourceOutputs` is positional: state NFT, escrow, then the supporter presence.
+    const decoded = decodeTransaction(hexToBin(res.body.unsignedHex));
+    if (typeof decoded === 'string') throw new Error(decoded);
+    expect(res.body.sourceOutputs).toHaveLength(decoded.inputs.length);
+    expect(res.body.sourceOutputs[0]).toMatchObject({
+      outpointTransactionHash: CO_TXID,
+      outpointIndex: 1,
+      unlockingBytecode: '',
+      valueSatoshis: COVENANT_SATS.toString(),
+    });
+    expect(res.body.sourceOutputs[0].token.category).toBe(STATE_CAT);
+    expect(res.body.sourceOutputs[0].token.nft.capability).toBe('mutable');
+    expect(res.body.sourceOutputs[1]).toMatchObject({
+      outpointTransactionHash: CO_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: COVENANT_SATS.toString(),
+    });
+    expect(res.body.sourceOutputs[1].token.category).toBe(FUNDS_CAT);
+    expect(res.body.sourceOutputs[2]).toMatchObject({
+      outpointTransactionHash: SUPPORTER_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: '1000000',
+    });
 
     // The unsigned template is not VM-valid (empty signature on the P2PKH input).
     await expect(provider.sendRawTransaction(res.body.unsignedHex)).rejects.toThrow();
@@ -461,6 +500,22 @@ describe('Token actions API', () => {
       .send({ funderInput: funderInput() })
       .expect(201);
     expect(prepared.body.total).toBe('151');
+
+    // `sourceOutputs` is positional: state NFT, escrow, funder input, service input.
+    const decoded = decodeTransaction(hexToBin(prepared.body.unsignedHex));
+    if (typeof decoded === 'string') throw new Error(decoded);
+    expect(prepared.body.sourceOutputs).toHaveLength(decoded.inputs.length);
+    expect(prepared.body.sourceOutputs[2]).toMatchObject({
+      outpointTransactionHash: FUND_TXID,
+      outpointIndex: 0,
+      unlockingBytecode: '',
+      valueSatoshis: COVENANT_SATS.toString(),
+    });
+    expect(prepared.body.sourceOutputs[2].token.category).toBe(FUNDS_CAT);
+    expect(prepared.body.sourceOutputs[2].token.amount).toBe('50');
+    expect(prepared.body.signableInputs[0].address).toBe(
+      'bchtest:qr78y59zz80dm3cwuk388r097pupwdguaugjl6473v',
+    );
 
     const signed = signPrepared(prepared.body.unsignedHex, prepared.body.signableInputs, {
       [SUPPORTER_LOCK]: SUPPORTER_KEY,

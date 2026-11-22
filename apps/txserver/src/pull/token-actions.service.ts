@@ -77,7 +77,8 @@ import {
 } from 'shared';
 import type { Subscription } from '../db/subscription.entity.js';
 import { SubscriptionRepository } from '../subscription/subscription.repository.js';
-import type { CounterpartyInput, SignableInput } from '../relay/mutual-consent-builder.js';
+import type { CounterpartyInput, SignableInput, SourceOutput } from '../relay/mutual-consent-builder.js';
+import { p2pkhAddress, sourceOutputsOf } from '../relay/mutual-consent-builder.js';
 import type { PullExecutorConfig } from './pull-executor.service.js';
 
 /** Satoshis parked on each covenant UTXO (token dust limit is 1000). */
@@ -119,6 +120,8 @@ export interface BuiltTokenWithdraw {
   nextState: SubscriptionState;
   /** The presence/funding inputs the client must sign (P2PKH). */
   signableInputs: SignableInput[];
+  /** Positional source outputs (one per tx input, in tx order) for WizardConnect. */
+  sourceOutputs: SourceOutput[];
 }
 
 export interface BuildTokenReactivateOptions {
@@ -145,6 +148,8 @@ export interface BuiltTokenReactivate {
   nextState: SubscriptionState;
   /** The funding input(s) the client must sign (P2PKH). */
   signableInputs: SignableInput[];
+  /** Positional source outputs (one per tx input, in tx order) for WizardConnect. */
+  sourceOutputs: SourceOutput[];
 }
 
 export interface BuildTokenFundOptions {
@@ -169,6 +174,8 @@ export interface BuiltTokenFund {
   nextState: SubscriptionState;
   /** The funding input(s) the client must sign (P2PKH). */
   signableInputs: SignableInput[];
+  /** Positional source outputs (one per tx input, in tx order) for WizardConnect. */
+  sourceOutputs: SourceOutput[];
 }
 
 @Injectable()
@@ -279,6 +286,7 @@ export class TokenActionsService {
       retained,
       nextState,
       signableInputs,
+      sourceOutputs: sourceOutputsOf(tx.inputs),
     };
   }
 
@@ -388,6 +396,7 @@ export class TokenActionsService {
       newFunds,
       nextState,
       signableInputs,
+      sourceOutputs: sourceOutputsOf(tx.inputs),
     };
   }
 
@@ -441,7 +450,7 @@ export class TokenActionsService {
     await this.addServiceFeeInput(tx, feeRate);
 
     const hex = tx.build();
-    return { hex, txid: txidOf(hex), total, nextState: state, signableInputs };
+    return { hex, txid: txidOf(hex), total, nextState: state, signableInputs, sourceOutputs: sourceOutputsOf(tx.inputs) };
   }
 
   /** Relay a client-signed `withdraw` (verified + broadcast; never re-signs). */
@@ -563,6 +572,7 @@ export class TokenActionsService {
       index,
       lockingBytecode: input.lockingBytecode.toLowerCase(),
       satoshis: input.satoshis.toString(),
+      address: p2pkhAddress(input.lockingBytecode),
       token: { category: input.category.toLowerCase(), amount: input.amount.toString() },
     });
   }
@@ -580,6 +590,7 @@ export class TokenActionsService {
       index,
       lockingBytecode: input.lockingBytecode.toLowerCase(),
       satoshis: input.satoshis.toString(),
+      address: p2pkhAddress(input.lockingBytecode),
     });
   }
 

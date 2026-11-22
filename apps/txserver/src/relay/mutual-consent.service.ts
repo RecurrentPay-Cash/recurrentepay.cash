@@ -65,6 +65,7 @@ import {
   type CounterpartyInput,
   type NewAssetInput,
   type SignableInput,
+  type SourceOutput,
 } from './mutual-consent-builder.js';
 
 /** DI token for the relay config (expiry window). */
@@ -102,6 +103,8 @@ export interface PrepareResult {
   unsignedHex: string;
   /** The presence/funding inputs the client must sign (P2PKH). */
   signableInputs: SignableInput[];
+  /** Positional source outputs (one per tx input, in tx order) for WizardConnect. */
+  sourceOutputs: SourceOutput[];
 }
 
 /** The result of a `broadcast` call. */
@@ -205,7 +208,7 @@ export class MutualConsentService {
     const sub = await this.subscriptions.findById(proposal.subscriptionId);
     if (sub === null) {
       await this.void(proposalId, now, 'subscription not found');
-      return { proposalId, status: 'void', unsignedHex: '', signableInputs: [] };
+      return { proposalId, status: 'void', unsignedHex: '', signableInputs: [], sourceOutputs: [] };
     }
 
     // Only the counterparty may prepare (the initiator's path is `revoke`). The API
@@ -217,19 +220,19 @@ export class MutualConsentService {
 
     // A non-pending proposal cannot be prepared (already broadcast/revoked/void).
     if (proposal.status !== 'pending') {
-      return { proposalId, status: proposal.status, unsignedHex: '', signableInputs: [] };
+      return { proposalId, status: proposal.status, unsignedHex: '', signableInputs: [], sourceOutputs: [] };
     }
 
     // Expiry: an expired proposal is not prepared; notify the counterparty.
     if (now >= proposal.expiresAt) {
       await this.expire(proposalId, now);
-      return { proposalId, status: 'expired', unsignedHex: '', signableInputs: [] };
+      return { proposalId, status: 'expired', unsignedHex: '', signableInputs: [], sourceOutputs: [] };
     }
 
     // The sub is terminated (canceled) → the proposal is void, never prepared.
     if (sub.stateOutpoint === null) {
       await this.void(proposalId, now, 'subscription terminated');
-      return { proposalId, status: 'void', unsignedHex: '', signableInputs: [] };
+      return { proposalId, status: 'void', unsignedHex: '', signableInputs: [], sourceOutputs: [] };
     }
 
     // Rebuild the tx against the live outpoints. The builder re-reads the covenant
@@ -247,7 +250,7 @@ export class MutualConsentService {
       // No live covenant UTXO (an intervening spend invalidated the sub) → void.
       this.logger.warn(`relay: rebuild failed for proposal ${proposalId}: ${(error as Error).message}`);
       await this.void(proposalId, now, (error as Error).message);
-      return { proposalId, status: 'void', unsignedHex: '', signableInputs: [] };
+      return { proposalId, status: 'void', unsignedHex: '', signableInputs: [], sourceOutputs: [] };
     }
 
     // Nothing is signed yet: the status stays `pending` until `broadcast`.
@@ -256,6 +259,7 @@ export class MutualConsentService {
       status: 'pending',
       unsignedHex: built.hex,
       signableInputs: built.signableInputs,
+      sourceOutputs: built.sourceOutputs,
     };
   }
 
