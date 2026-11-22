@@ -19,6 +19,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ChannelRepository } from './channel.repository.js';
 import { PlanRepository } from './plan.repository.js';
 import { AccountRepository } from './account.repository.js';
+import { DEMO_WALLETS, MAINNET_TEST_WALLETS, type DemoWallet } from './demo-wallets.js';
 
 export interface DemoSeedResult {
   accountId: number;
@@ -57,7 +58,90 @@ interface DemoChannel {
 const MONTH = 30 * 24 * 60 * 60;
 const WEEK = 7 * 24 * 60 * 60;
 
-/** The two demo channels (metadata only), in stable-id order. */
+/**
+ * The deterministic persona channels (task: judge demo wallets). One channel per
+ * supportee persona, owned by that persona's derived account, with 1–3 plans.
+ * Supporters have accounts but no channel. Appended **after** the two legacy
+ * channels so `/channels/1` and `/channels/2` keep their ids.
+ */
+const PERSONA_PLANS: Record<string, DemoPlan[]> = {
+  kallisti_supportee: [
+    {
+      title: 'Supporter',
+      description: 'Recurring support for Kallisti',
+      amount: 10_000n,
+      period: MONTH,
+      asset: 'BCH',
+      unit: 'USD',
+      benefits: ['Supporter badge'],
+      defaultMode: 1,
+    },
+    {
+      title: 'Patron',
+      description: 'Higher tier with perks',
+      amount: 50_000n,
+      period: MONTH,
+      asset: 'BCH',
+      unit: 'USD',
+      benefits: ['All Supporter perks', 'Monthly call'],
+      defaultMode: 1,
+    },
+  ],
+  sayoshi_supportee: [
+    {
+      title: 'Weekly',
+      description: 'Weekly support for Sayoshi',
+      amount: 2_000n,
+      period: WEEK,
+      asset: 'BCH',
+      unit: 'USD',
+      benefits: ['Weekly shout-out'],
+      defaultMode: 1,
+    },
+  ],
+  elliot_supportee: [
+    {
+      title: 'Coffee',
+      description: 'Buy Elliot a coffee each month',
+      amount: 5_000n,
+      period: MONTH,
+      asset: 'BCH',
+      unit: 'USD',
+      benefits: ['Supporter shout-out'],
+      defaultMode: 1,
+    },
+    {
+      title: 'Token',
+      description: 'Token-denominated support',
+      amount: 5_000n,
+      period: MONTH,
+      asset: 'token',
+      unit: 'PUSD',
+      benefits: ['Token-gated content'],
+      defaultMode: 0,
+    },
+  ],
+};
+
+/** The six persona channels (metadata only), in `DEMO_WALLETS` order. */
+const PERSONA_CHANNELS: DemoChannel[] = DEMO_WALLETS.map((wallet) => ({
+  accountPkh: wallet.pkh,
+  title: `${personaPrefix(wallet.persona)} (${wallet.persona.endsWith('_supportee') ? 'supportee' : 'supporter'})`,
+  description: `Demo channel for ${wallet.persona}.`,
+  payoutAddress: wallet.address,
+  offeredAssets: ['BCH'],
+  defaultMode: 1,
+  // Supporters get an account but no channel; give them an empty plan list.
+  plans: PERSONA_PLANS[wallet.persona] ?? [],
+}));
+
+/** `kallisti_supportee` → `Kallisti`. */
+function personaPrefix(persona: string): string {
+  const name = persona.split('_')[0] ?? persona;
+  return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
+/** The two legacy demo channels (metadata only), in stable-id order. */
 const DEMO_CHANNELS: DemoChannel[] = [
   {
     accountPkh: DEMO_ACCOUNT_PKH,
@@ -143,8 +227,10 @@ export class DemoSeedService {
     let firstPlanIds: number[] = [];
     let created = false;
 
-    for (const fixture of DEMO_CHANNELS) {
+    for (const fixture of [...DEMO_CHANNELS, ...PERSONA_CHANNELS]) {
       const account = await this.accounts.findOrCreateByPkh(fixture.accountPkh);
+      // Supporters have an account but no channel (empty plan list).
+      if (fixture.plans.length === 0) continue;
       const existing = await this.channels.findByOwner(account.id);
       let channelId: number;
       if (existing !== null) {
@@ -194,6 +280,21 @@ export class DemoSeedService {
     this.logger.log(
       `demo seed ${created ? 'created' : 'reused'} channels [${channels.map((c) => `${c.id}:${c.title}`).join(', ')}]`,
     );
+
+    // Env-gated mainnet test pair: accounts only (they are parties, not
+    // creators). The derived secrets are printed by `seed-demo.ts`, never
+    // committed. Skipped entirely when `DEMO_MAINNET_SEED` is unset.
+    if (MAINNET_TEST_WALLETS.length === 0) {
+      this.logger.log('set DEMO_MAINNET_SEED to derive the mainnet test wallets');
+    } else {
+      for (const wallet of MAINNET_TEST_WALLETS) {
+        await this.accounts.findOrCreateByPkh(wallet.pkh);
+      }
+      this.logger.log(
+        `demo seed mainnet test accounts [${MAINNET_TEST_WALLETS.map((w) => w.persona).join(', ')}]`,
+      );
+    }
+
     return {
       accountId: firstAccountId,
       channelId: firstChannelId,

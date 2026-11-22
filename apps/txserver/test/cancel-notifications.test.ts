@@ -68,6 +68,9 @@ describe('cancel notification wiring (B2)', () => {
       dataSource.getRepository(AutoCancelPolicy),
       repository,
       executor,
+      undefined,
+      undefined,
+      undefined,
     );
 
     // The production wiring: a scheduler, a notification service, and the

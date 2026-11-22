@@ -52,4 +52,9 @@ export class ChannelAutoCancelPolicyRepository {
   async find(channelId: number): Promise<ChannelAutoCancelPolicy | null> {
     return this.repo.findOne({ where: { channelId } });
   }
+
+  /** Every enabled channel policy (the auto-cancel scan's inheritance source). */
+  async findEnabled(): Promise<ChannelAutoCancelPolicy[]> {
+    return this.repo.find({ where: { enabled: true } });
+  }
 }

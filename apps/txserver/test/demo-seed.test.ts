@@ -1,8 +1,9 @@
 /**
  * Demo seed tests (Slice 6, task 8.19 — a task, not a requirement).
  *
- * The judge demo seed creates a mock channel + plans so the demo has data. The
- * key property is **idempotence**: running it twice does not duplicate anything.
+ * The judge demo seed creates mock channels + plans (and now the six
+ * deterministic demo personas) so the demo has data. The key property is
+ * **idempotence**: running it twice does not duplicate anything.
  */
 import { DataSource } from 'typeorm';
 import { Account } from '../src/db/account.entity.js';
@@ -13,6 +14,7 @@ import { AccountRepository } from '../src/offchain/account.repository.js';
 import { ChannelRepository } from '../src/offchain/channel.repository.js';
 import { PlanRepository } from '../src/offchain/plan.repository.js';
 import { DemoSeedService } from '../src/offchain/demo-seed.service.js';
+import { DEMO_WALLETS } from '../src/offchain/demo-wallets.js';
 
 describe('Demo seed', () => {
   let dataSource: DataSource;
@@ -49,19 +51,54 @@ describe('Demo seed', () => {
     expect(result.planIds.length).toBeGreaterThan(0);
 
     const channels = await dataSource.getRepository(Channel).find({ order: { id: 'ASC' } });
-    expect(channels).toHaveLength(2);
+    // Two legacy demo channels first (stable ids), then the six personas.
+    expect(channels.length).toBeGreaterThanOrEqual(2);
     // Stable ids: the picker links to /channels/1 and /channels/2.
-    expect(channels.map((c) => c.id)).toEqual([1, 2]);
-    expect(channels.map((c) => c.title)).toEqual(['RecurrentPay.Cash', 'Alice']);
+    expect(channels.slice(0, 2).map((c) => c.id)).toEqual([1, 2]);
+    expect(channels.slice(0, 2).map((c) => c.title)).toEqual(['RecurrentPay.Cash', 'Alice']);
 
     // The result exposes every seeded channel (id + title), in stable order.
-    expect(result.channels.map((c) => c.title)).toEqual(['RecurrentPay.Cash', 'Alice']);
+    expect(result.channels.slice(0, 2).map((c) => c.title)).toEqual(['RecurrentPay.Cash', 'Alice']);
     expect(result.channels[0]?.id).toBe(channels[0]?.id);
     expect(result.channels[1]?.id).toBe(channels[1]?.id);
 
     const plans = await dataSource.getRepository(Plan).find();
     expect(plans.length).toBeGreaterThan(result.planIds.length);
     expect(plans.every((p) => p.visible)).toBe(true);
+  });
+
+  it('creates an account for all six demo personas', async () => {
+    await seed.seed();
+    const accounts = await dataSource.getRepository(Account).find();
+    const pkhs = accounts.map((a) => a.pkh);
+    for (const wallet of DEMO_WALLETS) {
+      expect(pkhs).toContain(wallet.pkh);
+    }
+    // 2 legacy demo accounts + 6 personas.
+    expect(accounts.length).toBe(8);
+  });
+
+  it('creates a channel with plans for each of the three supportee personas', async () => {
+    await seed.seed();
+    const supportees = DEMO_WALLETS.filter((w) => w.persona.endsWith('_supportee'));
+
+    for (const wallet of supportees) {
+      const account = await dataSource
+        .getRepository(Account)
+        .findOne({ where: { pkh: wallet.pkh } });
+      expect(account).not.toBeNull();
+      const channel = await dataSource
+        .getRepository(Channel)
+        .findOne({ where: { ownerAccountId: account!.id } });
+      expect(channel).not.toBeNull();
+      expect(channel!.payoutAddress).toBe(wallet.address);
+
+      const plans = await dataSource
+        .getRepository(Plan)
+        .find({ where: { channelId: channel!.id } });
+      expect(plans.length).toBeGreaterThanOrEqual(1);
+      expect(plans.length).toBeLessThanOrEqual(3);
+    }
   });
 
   it('is idempotent — running twice does not duplicate', async () => {
@@ -73,8 +110,12 @@ describe('Demo seed', () => {
     expect(second.planIds).toEqual(first.planIds);
     expect(second.channels).toEqual(first.channels);
 
-    expect(await dataSource.getRepository(Channel).count()).toBe(2);
-    expect(await dataSource.getRepository(Plan).count()).toBe(4);
-    expect(await dataSource.getRepository(Account).count()).toBe(2);
+    // 2 legacy channels + 3 supportee channels.
+    expect(await dataSource.getRepository(Channel).count()).toBe(5);
+    expect(await dataSource.getRepository(Account).count()).toBe(8);
+    // Counts are stable across re-seeds.
+    const planCount = await dataSource.getRepository(Plan).count();
+    await seed.seed();
+    expect(await dataSource.getRepository(Plan).count()).toBe(planCount);
   });
 });

@@ -9,7 +9,8 @@ import { DataSource } from 'typeorm';
 import { binToHex, hexToBin } from '@bitauth/libauth';
 import { MockNetworkProvider, SignatureTemplate, utils } from 'cashscript';
 import artifact from 'contracts/artifacts/token-subscription.artifact.js';
-import { covenantLockingBytecode, encodeCommitment, reverseCategory } from 'shared';
+import oracleArtifact from 'contracts/artifacts/oracle-subscription.artifact.js';
+import { covenantLockingBytecode, encodeCommitment, oracle, reverseCategory } from 'shared';
 import { Subscription } from '../src/db/subscription.entity.js';
 import { Cancel } from '../src/db/cancel.entity.js';
 import { AutoCancelPolicy } from '../src/db/auto-cancel-policy.entity.js';
@@ -53,6 +54,9 @@ describe('AutoCancelService', () => {
       dataSource.getRepository(AutoCancelPolicy),
       repository,
       executor,
+      undefined,
+      undefined,
+      undefined,
     );
   });
 
@@ -252,5 +256,135 @@ describe('AutoCancelService', () => {
     // The warning's `at` is the stable threshold timestamp (idempotency key).
     const warning = first.find((e) => e.type === 'auto_cancel_warning')!;
     expect(warning.at).toBe(T + 3 * DAY);
+  });
+
+  // --- Oracle (BCH) subs: single UTXO, sats, priced at `lastRate` ------------
+
+  const ORACLE_CAT = 'c0ffee00deadbeef'.repeat(4);
+  const ORACLE_LOCK = covenantLockingBytecode(reverseCategory(ORACLE_CAT), oracleArtifact.bytecode);
+  const PRICE = 50_000; // cents/BCH → 10 cents = 20_000 sats/period
+
+  /** The oracle commitment state for a sub created at `T` in mode B. */
+  function makeOracleState(over: Partial<oracle.OracleState> = {}): oracle.OracleState {
+    return {
+      supporterPkh: new Uint8Array(20).fill(0x11),
+      supporteePkh: new Uint8Array(20).fill(0x22),
+      servicePkh: hexToBin(SERVICE_PKH_HEX),
+      amount: 10n,
+      amountNext: 10n,
+      period: DAY,
+      periodNext: DAY,
+      lastPeriodTime: T,
+      mode: 1,
+      oraclePkHash: new Uint8Array(20).fill(0x55),
+      lastRate: PRICE,
+      ...over,
+    };
+  }
+
+  /** Seed the oracle covenant's single UTXO (state NFT + sats) and the fee input. */
+  function seedOracleChain(state: oracle.OracleState, balance: bigint): void {
+    provider.addUtxo(ORACLE_LOCK, {
+      txid: CO_TXID,
+      vout: 0,
+      satoshis: balance,
+      token: {
+        category: ORACLE_CAT,
+        amount: 0n,
+        nft: { capability: 'mutable', commitment: binToHex(oracle.encodeCommitment(state)) },
+      },
+    });
+    provider.addUtxo(SERVICE_LOCK, { txid: SERVICE_TXID, vout: 0, satoshis: 1_000_000n });
+  }
+
+  /** Track an oracle sub whose balance is the single UTXO's satoshis. */
+  async function trackOracle(balance: bigint) {
+    const state = makeOracleState();
+    return repository.upsert({
+      stateCategory: ORACLE_CAT,
+      stateOutpoint: 'co:0',
+      escrowOutpoint: null,
+      assetType: 'oracle',
+      fundsCategory: '',
+      mode: state.mode,
+      supporterPkh: binToHex(state.supporterPkh),
+      supporteePkh: binToHex(state.supporteePkh),
+      servicePkh: SERVICE_PKH_HEX,
+      amount: state.amount,
+      amountNext: state.amountNext,
+      period: state.period,
+      periodNext: state.periodNext,
+      lastPeriodTime: state.lastPeriodTime,
+      escrowBalance: balance,
+      status: 'paused',
+      nextPaymentAt: state.lastPeriodTime + state.period,
+      oraclePkHash: binToHex(state.oraclePkHash),
+      lastRate: state.lastRate,
+    });
+  }
+
+  async function armOraclePolicy(thresholdPeriods = 3, graceSeconds = DAY) {
+    await dataSource.getRepository(AutoCancelPolicy).save({
+      subscriptionId: ORACLE_CAT,
+      supporteePkh: 'ac'.repeat(20),
+      thresholdPeriods,
+      graceSeconds,
+      enabled: true,
+    });
+  }
+
+  it('auto-cancels a paused oracle sub with a VM-accepted oracle cancel', async () => {
+    // 10 cents/period at 50_000 cents/BCH → 20_000 sats/period. A balance of
+    // 20_000 covers exactly one period, so from period 2 on it is paused.
+    await trackOracle(20_000n);
+    await armOraclePolicy(3, DAY);
+    seedOracleChain(makeOracleState(), 20_000n);
+
+    // Threshold at T + 3·DAY; grace 1 day → fire at T + 4·DAY. Scan at T + 5·DAY
+    // so the cancel's own boundary gate (`now ≥ lastPeriodTime + period`) passes.
+    const events = await autoCancel.scan(T + 5 * DAY);
+    const canceled = events.find((e) => e.type === 'canceled');
+    expect(canceled).toBeDefined();
+    expect(await dataSource.getRepository(Cancel).count()).toBe(1);
+
+    // Nothing remains at the oracle covenant address (the state NFT is burnt).
+    const remaining = await provider.getUtxosForLockingBytecode(hexToBin(ORACLE_LOCK));
+    expect(remaining).toHaveLength(0);
+  });
+
+  it('disarms an oracle policy when the balance is topped up during grace', async () => {
+    await trackOracle(20_000n);
+    await armOraclePolicy(3, DAY);
+    // A top-up: the balance now covers the arrears (≥ payable at T + 4·DAY).
+    seedOracleChain(makeOracleState(), 100_000n);
+    await repository.upsert({
+      stateCategory: ORACLE_CAT,
+      stateOutpoint: 'co:0',
+      escrowOutpoint: null,
+      assetType: 'oracle',
+      fundsCategory: '',
+      mode: 1,
+      supporterPkh: binToHex(makeOracleState().supporterPkh),
+      supporteePkh: binToHex(makeOracleState().supporteePkh),
+      servicePkh: SERVICE_PKH_HEX,
+      amount: 10n,
+      amountNext: 10n,
+      period: DAY,
+      periodNext: DAY,
+      lastPeriodTime: T,
+      escrowBalance: 100_000n,
+      status: 'active',
+      nextPaymentAt: T + DAY,
+      oraclePkHash: binToHex(makeOracleState().oraclePkHash),
+      lastRate: PRICE,
+    });
+
+    const events = await autoCancel.scan(T + 5 * DAY);
+    expect(events.some((e) => e.type === 'canceled')).toBe(false);
+    expect(await dataSource.getRepository(Cancel).count()).toBe(0);
+    const policy = await dataSource
+      .getRepository(AutoCancelPolicy)
+      .findOneByOrFail({ subscriptionId: ORACLE_CAT });
+    expect(policy.enabled).toBe(false);
   });
 });
