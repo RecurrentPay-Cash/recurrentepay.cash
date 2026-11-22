@@ -80,6 +80,25 @@ describe('reactivate (waive arrears, promote terms, stay on the grid)', () => {
     expect(await sub.readRolePaidSats(sub.service)).toBeGreaterThanOrEqual(10_000n);
   });
 
+  it('mode A accepts exactly one fresh period (gate must not double-count)', async () => {
+    // Regression: `stateOut − balance` under-counts the fresh funds by `gppNew`
+    // in mode A (the prepaid period is paid out), so a gate on the raw difference
+    // rejected the minimum funding. With the add-back, one fresh period passes.
+    const sub = base({ mode: MODE_A, amount: 500n, balance: 400_000n });
+    sub.advance(2 * DAY);
+    const s = sub.settlement(PRICE);
+    expect(s.payable).toBe(3_000_000n); // paused
+    // Exactly one fresh period: extraFunding = gppNew = 1,000,000.
+    await sub.reactivate(GPP5, PRICE).send();
+    const after = await sub.readCovenant();
+    // contractBalance = balance + newFunds − gppNew = 400,000 + 1,000,000 − 1,000,000.
+    expect(after.sats).toBe(400_000n);
+    // supportee = spendable + gppNew − fee = 399,000 + 1,000,000 − 10,000.
+    expect(await sub.readRolePaidSats(sub.supportee)).toBe(1_389_000n);
+    // service = perPeriodFee(gppNew) = 10,000.
+    expect(await sub.readRolePaidSats(sub.service)).toBeGreaterThanOrEqual(10_000n);
+  });
+
   it('stays on the grid (no drift)', async () => {
     const sub = base({ mode: MODE_B, amount: 500n, balance: 400_000n });
     sub.advance(2 * DAY + 90);

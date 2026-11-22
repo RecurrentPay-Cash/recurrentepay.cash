@@ -584,6 +584,12 @@ contract OracleSubscription(bytes32 stateCategory) {
             stateOut = stateOut + 1;
         }
         int newFunds = tx.outputs[stateOut].value - balance;
+        // In mode A the prepaid period (`gppNew`) is paid out to the supportee, so
+        // the state output is `balance + fresh − gppNew`; add it back to recover
+        // the fresh funding. Mode B escrows the fresh period, so no adjustment.
+        if (mode == 0) {
+            newFunds = newFunds + gppNew;
+        }
         require(newFunds >= gppNew, "reactivate: at least one fresh period must be funded");
 
         // The contract re-locks the whole remaining balance plus the fresh funds,
@@ -592,9 +598,7 @@ contract OracleSubscription(bytes32 stateCategory) {
         if (mode == 0) {
             contractBalance = balance + newFunds - gppNew;
         }
-        // `newFunds` already folds the state output's own value, so the state
-        // amount is exactly what the builder set: balance + fresh − prepaid.
-        require(tx.outputs[stateOut].value == balance + newFunds, "reactivate: bad state amount");
+        require(tx.outputs[stateOut].value == contractBalance, "reactivate: bad state amount");
 
         // Advance on the grid (waives the unpaid remainder) and promote terms.
         int newAnchor = lastPeriodTime + n * period;
