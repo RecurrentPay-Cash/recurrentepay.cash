@@ -29,6 +29,8 @@ import { AuthGuard, type AuthedRequest } from '../auth/auth.guard.js';
 import { AutoCancelPolicyRepository } from './auto-cancel-policy.repository.js';
 import { NotificationRepository } from '../notifications/notification.repository.js';
 import { ScheduledCancelService } from '../cancel/scheduled-cancel.service.js';
+import { OffchainService } from '../offchain/offchain.service.js';
+import { parseId } from './query-id.js';
 
 /** Filtering query (§ Subscription filtering — basic). */
 export interface SubscriptionFilter {
@@ -51,6 +53,7 @@ export class SubscriptionsController {
     private readonly notifications: NotificationRepository,
     private readonly scheduledCancels: ScheduledCancelService,
     private readonly guard: AuthGuard,
+    private readonly offchain: OffchainService,
   ) {}
 
   /** The caller's subscriptions, with derived fields and basic filtering. */
@@ -66,14 +69,24 @@ export class SubscriptionsController {
     const rows = await this.repository.findByParty(pkh);
     const now = Math.floor(Date.now() / 1000);
 
-    // channel/plan filters require the off-chain link table (Slice 6). Until it
-    // lands, filtering by an unknown channel/plan yields nothing rather than
-    // silently returning everything (fail-closed).
-    if (channel !== undefined || plan !== undefined) return [];
+    // channel/plan filters join through the off-chain `subscription_link` table
+    // (Slice 6). A sub with no link matches neither filter; an unknown
+    // channel/plan yields nothing (fail-closed, never "return everything").
+    const channelId = parseId(channel);
+    const planId = parseId(plan);
+    let linkedIds: Set<string> | null = null;
+    if (channelId !== undefined || planId !== undefined) {
+      const ids = await this.offchain.linkedSubscriptionIds({
+        channelId,
+        planId,
+      });
+      linkedIds = new Set(ids);
+    }
 
     let views = rows.map((row) => toView(row, pkh, now));
     if (role !== undefined) views = views.filter((v) => v.role === role);
     if (state !== undefined) views = views.filter((v) => v.status === state);
+    if (linkedIds !== null) views = views.filter((v) => linkedIds.has(v.stateCategory));
     return views;
   }
 

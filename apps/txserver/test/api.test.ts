@@ -32,6 +32,15 @@ import { ScheduledCancel } from '../src/db/scheduled-cancel.entity.js';
 import { CancelRepository } from '../src/cancel/cancel.repository.js';
 import { CancelExecutorService } from '../src/cancel/cancel-executor.service.js';
 import { ScheduledCancelService } from '../src/cancel/scheduled-cancel.service.js';
+import { Account } from '../src/db/account.entity.js';
+import { Channel } from '../src/db/channel.entity.js';
+import { Plan } from '../src/db/plan.entity.js';
+import { SubscriptionLink } from '../src/db/subscription-link.entity.js';
+import { AccountRepository } from '../src/offchain/account.repository.js';
+import { ChannelRepository } from '../src/offchain/channel.repository.js';
+import { PlanRepository } from '../src/offchain/plan.repository.js';
+import { SubscriptionLinkRepository } from '../src/offchain/subscription-link.repository.js';
+import { OffchainService } from '../src/offchain/offchain.service.js';
 import { DAY, FUNDS_CAT, STATE_CAT, T } from './fixtures.js';
 
 const { hash160 } = utils;
@@ -105,7 +114,18 @@ describe('REST API', () => {
     dataSource = new DataSource({
       type: 'better-sqlite3',
       database: ':memory:',
-      entities: [Subscription, AutoCancelPolicy, Notification, WebhookEndpoint, Cancel, ScheduledCancel],
+      entities: [
+        Subscription,
+        AutoCancelPolicy,
+        Notification,
+        WebhookEndpoint,
+        Cancel,
+        ScheduledCancel,
+        Account,
+        Channel,
+        Plan,
+        SubscriptionLink,
+      ],
       synchronize: true,
     });
     await dataSource.initialize();
@@ -129,6 +149,12 @@ describe('REST API', () => {
       cancels,
       cancelExecutor,
     );
+    const offchain = new OffchainService(
+      new AccountRepository(dataSource.getRepository(Account)),
+      new ChannelRepository(dataSource.getRepository(Channel)),
+      new PlanRepository(dataSource.getRepository(Plan)),
+      new SubscriptionLinkRepository(dataSource.getRepository(SubscriptionLink)),
+    );
 
     const moduleRef = await Test.createTestingModule({
       controllers: [
@@ -144,6 +170,7 @@ describe('REST API', () => {
         { provide: NotificationRepository, useValue: notifications },
         { provide: WebhookEndpointRepository, useValue: webhooks },
         { provide: ScheduledCancelService, useValue: scheduledCancels },
+        { provide: OffchainService, useValue: offchain },
         { provide: ChallengeService, useValue: challenges },
         { provide: SessionService, useValue: sessions },
         { provide: AuthGuard, useValue: guard },
@@ -165,6 +192,10 @@ describe('REST API', () => {
     await dataSource.getRepository(Notification).clear();
     await dataSource.getRepository(WebhookEndpoint).clear();
     await dataSource.getRepository(ScheduledCancel).clear();
+    await dataSource.getRepository(SubscriptionLink).clear();
+    await dataSource.getRepository(Plan).clear();
+    await dataSource.getRepository(Channel).clear();
+    await dataSource.getRepository(Account).clear();
 
     // Obtain a session for A via the challenge → signature flow.
     const challengeRes = await request(app.getHttpServer())
@@ -275,11 +306,11 @@ describe('REST API', () => {
   });
 
   it('filters by channel and plan through subscription_link', async () => {
-    // No link rows exist yet in this fixture DB → filtering by an unknown channel
-    // yields nothing rather than leaking everything.
+    // No link rows exist in this fixture DB → filtering by an unknown channel
+    // still yields nothing (fail-closed, never "return everything").
     await seedSubscription({ stateCategory: STATE_CAT, supporterPkh: A_PKH });
     const res = await request(app.getHttpServer())
-      .get('/subscriptions?channel=none')
+      .get('/subscriptions?channel=999999')
       .set('Authorization', `Bearer ${aToken}`)
       .expect(200);
     expect(res.body).toEqual([]);
