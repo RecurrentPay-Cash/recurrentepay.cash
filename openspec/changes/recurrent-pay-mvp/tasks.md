@@ -266,8 +266,7 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
   round-trip)
 - [x] 8.14 **DB schema** — subscription, pull, notification, webhook_endpoint, auto_cancel_policy,
   scheduled_cancel, oracle_message, account, channel, plan, subscription_link,
-  mutual_consent_proposal (migrations; derived values are caches)
-  — **Slice 1:** only the `subscription` table (derived-state cache) + migration tooling; remaining
+  mutual_consent_proposal (migrations; derived values are caches)  — **Slice 1:** only the `subscription` table (derived-state cache) + migration tooling; remaining
   tables land with their slices
   — **Slice 3a:** `pull` table (`pull.entity.ts` + migration `1700000000001-create-pull.ts`)
   — **Slice 3b:** `oracle_message` table + `subscription.oracle_pk_hash`/`oracle_pubkey`/`last_rate`
@@ -281,6 +280,9 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
   — **Slice 6:** `account`, `channel`, `plan`, `subscription_link` tables (migration
   `1700000000006-create-offchain.ts`; entities registered in data-source /
   database.module / run-migrations; up/down round-trip tested)
+  — **Slice 7:** `mutual_consent_proposal` table (migration
+  `1700000000007-create-mutual-consent-proposal.ts`; entity registered in data-source /
+  database.module / run-migrations)
 - [x] 8.15 **Off-chain channel/plan CRUD** — authenticated create/edit/hide for a creator's channel
   and plans; plan data API for the wizard; write the subscription-link on creation
   — **Slice 6:** `OffchainModule` (`offchain.service.ts`, `offchain.controller.ts`,
@@ -295,8 +297,29 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
 - [x] 8.16 **Future-periods computation** — expose `floor(escrow / amount)` per subscription
   — **Slice 1:** the pure computation + unit tests (API exposure in Slice 4)
   — **Slice 4:** exposed as `futurePeriods` on `GET /subscriptions` and `GET /subscriptions/:id`
-- [ ] 8.17 **Mutual-consent relay** — store/notify a `modify`/`migrate` proposal, track signatures,
+- [x] 8.17 **Mutual-consent relay** — store/notify a `modify`/`migrate` proposal, track signatures,
   rebuild (never replay) at signing, broadcast on both-present; fee = initiator; expiry (24h) + revoke
+  — **Slice 7:** `RelayModule` (`mutual-consent.service.ts`, `mutual-consent-builder.ts`,
+  `relay.controller.ts`, `mutual-consent-proposal.repository.ts`). `propose` stores a `pending`
+  proposal (24h expiry, configurable via `PROPOSAL_EXPIRY_SECONDS`) + notifies the counterparty;
+  `sign` **rebuilds the tx against the current outpoints** (never replays stored bytes) and
+  broadcasts, marking `broadcast`; `revoke`/`expire`/`void` paths; `expireDue` is wired into the
+  scheduler cycle (a due proposal expires + notifies without a `sign` attempt). The builder mirrors
+  `pull-executor`'s provider/`nLockTime`/presence pattern; each party's presence input is supplied
+  via the API (`CounterpartyInput` — outpoint + satoshis + P2PKH lock, **no private key**: the
+  covenant's `isPresent` reads only the lock, so the relay assembles an unsigned placeholder and the
+  party signs client-side in production). The request body is whitelisted, so a stray `privateKey`
+  is dropped. **Only the counterparty may `sign`; only the initiator may `revoke`** (enforced at the
+  controller and re-checked in the service). The initiator's input pays the fee and receives the
+  change. `migrate` (token path) consumes the caller-supplied new-category funding input(s)
+  (`newAssetInputs`) and sets `newEscrow = totalIn(newCategory)`. Authenticated, party-scoped routes
+  (`POST /subscriptions/:id/proposals`, `POST /proposals/:id/sign|revoke`, `GET /proposals/:id`,
+  `GET /subscriptions/:id/proposals`; non-party → 404). **Oracle migrate is a marked TODO** (needs
+  the oracle contract artifact, not in this worktree); the token path is implemented. Tests:
+  `mutual-consent.test.ts` (lifecycle, rebuild-not-replay via a `setPkh` between propose and sign,
+  VM-acceptance against the real token contract for both `modify` and token `migrate`, void/expiry/
+  revoke, oracle-migrate refusal, role enforcement), `relay-api.test.ts` (401/404/400, party
+  scoping, role enforcement, `privateKey` stripping), `scheduler.test.ts` (scan-driven expiry).
 - [x] 8.18 **Subscription filtering** — by channel / state / plan (basic; full matrix post-MVP)
   — **Slice 4:** `state` and `role` filters land with the API (both tested);
   `channel`/`plan` filters fail-closed until the `subscription_link` table lands
