@@ -62,10 +62,16 @@ status: active, paused (underfunded), due, canceled. Each card SHALL show amount
 payment estimate, escrow balance, and quick actions. The balance SHALL always be presented as the
 **escrow** — strays are never shown as, or counted toward, the balance.
 
-Stray funds-category UTXOs (arising only from a direct send to the covenant address — `fund` never
-creates them) SHALL be **hidden as a concept**. The app SHALL NOT expose a consolidate action; the
-txserver consolidates them automatically (see the txserver spec). External value is surfaced only
-through the notices below, never as a separate balance line.
+Stray funds-category UTXOs SHALL be **hidden as a concept**. The app SHALL NOT expose a direct-send
+or consolidate action, and all app-built transactions SHALL use the subscription's **funds
+category** (the app SHALL NOT let the user fund with a different token category). The txserver
+sweeps strays automatically when it builds a transaction (see the txserver spec § Stray-value
+sweep). External value is surfaced only through the notices below, never as a separate balance line.
+
+> **The app never builds a direct send.** It exposes no raw "send to this address" action and never
+> funds with a different token category, so any value that reaches the covenant address outside the
+> app's accounting arrived from elsewhere (e.g. a manual transfer from a user's wallet). The
+> txserver watches the address and handles such value regardless of source.
 
 #### Scenario: External value absorbed by a user transaction
 - **GIVEN** a subscription with stray funds-category UTXOs and/or foreign-category tokens at the
@@ -76,16 +82,16 @@ through the notices below, never as a separate balance line.
   recovered X; N tokens were sent to your address" for `withdraw`/`cancel`)
 
 #### Scenario: External value absorbed by the txserver
-- **GIVEN** a subscription with strays the txserver consolidates on its own (no user transaction)
-- **WHEN** the consolidation transaction is broadcast and accepted (0conf — no block wait)
+- **GIVEN** a subscription with strays the txserver sweeps when it builds a transaction (no user transaction)
+- **WHEN** the transaction is broadcast and accepted (0conf — no block wait)
 - **THEN** the app notifies the user **after** the fact (the balance changes with an explanation),
   since there was no transaction for the user to preview
 
 > **Rule:** a **user** transaction that absorbs external value is explained **before signing** (the
-> preview); an **automatic** txserver consolidation is explained **after it is broadcast** (a
-> notification, fired on 0conf acceptance — not on block confirmation, and not on tx build). The
-> balance is always escrow; strays are never surfaced on their own, so the app never shows value
-> that is not yet in the escrow.
+> preview); an **automatic** txserver sweep is explained **after it is broadcast** (a notification,
+> fired on 0conf acceptance — not on block confirmation, and not on tx build). The balance is always
+> escrow; strays are never surfaced on their own, so the app never shows value that is not yet in
+> the escrow.
 
 #### Scenario: Paused subscription surfaced (supporter)
 - **GIVEN** a subscription whose escrow (co-created funds UTXO, seed excluded) is below the next
@@ -111,7 +117,9 @@ swap for BCH subs — mutual, or service-initiated for emergency recovery), and 
 
 Top-up SHALL be offered only on **active** subscriptions. On a paused sub the app SHALL hide the
 top-up action and redirect the supporter to **reactivate** instead, and SHALL never build a fund
-transaction that would leave the sub paused.
+transaction that would leave the sub paused. The app SHALL build every transaction with the
+subscription's **funds category** — it SHALL NOT offer a direct send to the covenant address, and
+SHALL NOT let the user fund with a different token category.
 
 Cancel SHALL be available to both roles. Selecting cancel opens a **cancel card** that explains the
 function and lists, concisely, the consequences **for the viewer's role** (different for supporter
@@ -127,6 +135,12 @@ what the transaction does with it (see the Dashboard requirement).
 - **THEN** the app explains the cancel does not take effect until the current period's boundary,
   and offers to **schedule** it (the cancel is built with `nLockTime = boundary` and broadcast at
   the boundary) or **remind later**
+
+#### Scenario: No direct send and no wrong-category funding
+- **GIVEN** a user on a subscription's page
+- **WHEN** they look for a way to send funds to the covenant
+- **THEN** the app offers only the `fund` action (built with the subscription's funds category) —
+  it exposes no raw "send to this address" action and no way to fund with a different token category
 
 #### Scenario: Cancel card consequences (supporter)
 - **GIVEN** a supporter opening the cancel card

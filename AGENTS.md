@@ -34,6 +34,13 @@ pnpm --filter txserver dev     # NestJS dev server
 pnpm --filter contracts test   # Jest + MockNetworkProvider
 ```
 
+### TxServer DB tooling (Slice 1)
+
+The txserver uses **TypeORM** (not Prisma): first-party `@nestjs/typeorm` integration, plain-TS
+migrations (no separate schema DSL or generated client step), and `bigint`-as-string mapping for
+token amounts. Run migrations with `pnpm --filter txserver migration:run` against `DATABASE_URL`.
+Integration tests use an ephemeral SQLite DB (`better-sqlite3`) so they run without Postgres.
+
 ### Networks
 
 - Development: **chipnet** (faucet: https://chipnet.cash/)

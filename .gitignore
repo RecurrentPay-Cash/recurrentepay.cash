@@ -2,3 +2,5 @@ node_modules
 initial-planning.md
 openspec/spec-ideas
 .markdownlint.json
+.env
+apps/*/.env
