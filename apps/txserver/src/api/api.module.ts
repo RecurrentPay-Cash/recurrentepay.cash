@@ -12,6 +12,7 @@ import { SubscriptionModule } from '../subscription/subscription.module.js';
 import { NotificationsModule } from '../notifications/notifications.module.js';
 import { AuthModule } from '../auth/auth.module.js';
 import { CancelModule } from '../cancel/cancel.module.js';
+import { OffchainModule } from '../offchain/offchain.module.js';
 import { AutoCancelPolicy } from '../db/auto-cancel-policy.entity.js';
 import { AuthController } from './auth.controller.js';
 import { SubscriptionsController } from './subscriptions.controller.js';
@@ -26,6 +27,7 @@ import { AutoCancelPolicyRepository } from './auto-cancel-policy.repository.js';
     NotificationsModule,
     AuthModule,
     CancelModule,
+    OffchainModule,
   ],
   controllers: [
     AuthController,

@@ -5,6 +5,7 @@ import { CreateOracleMessage1700000000002 } from './migrations/1700000000002-cre
 import { CreateNotificationWebhook1700000000003 } from './migrations/1700000000003-create-notification-webhook.js';
 import { CreateScheduledCancel1700000000004 } from './migrations/1700000000004-create-scheduled-cancel.js';
 import { AddPolicyWarnedAt1700000000005 } from './migrations/1700000000005-add-policy-warned-at.js';
+import { CreateOffchain1700000000006 } from './migrations/1700000000006-create-offchain.js';
 import { loadConfig } from '../config.js';
 
 /**
@@ -22,6 +23,7 @@ async function main(): Promise<void> {
       CreateNotificationWebhook1700000000003,
       CreateScheduledCancel1700000000004,
       AddPolicyWarnedAt1700000000005,
+      CreateOffchain1700000000006,
     ],
   });
   await dataSource.initialize();

@@ -10,6 +10,10 @@ import { WebhookEndpoint } from './webhook-endpoint.entity.js';
 import { AutoCancelPolicy } from './auto-cancel-policy.entity.js';
 import { Cancel } from './cancel.entity.js';
 import { ScheduledCancel } from './scheduled-cancel.entity.js';
+import { Account } from './account.entity.js';
+import { Channel } from './channel.entity.js';
+import { Plan } from './plan.entity.js';
+import { SubscriptionLink } from './subscription-link.entity.js';
 
 /**
  * Postgres access via TypeORM.
@@ -42,6 +46,10 @@ import { ScheduledCancel } from './scheduled-cancel.entity.js';
             AutoCancelPolicy,
             Cancel,
             ScheduledCancel,
+            Account,
+            Channel,
+            Plan,
+            SubscriptionLink,
           ],
           synchronize: false,
         };
@@ -56,6 +64,10 @@ import { ScheduledCancel } from './scheduled-cancel.entity.js';
       AutoCancelPolicy,
       Cancel,
       ScheduledCancel,
+      Account,
+      Channel,
+      Plan,
+      SubscriptionLink,
     ]),
   ],
   exports: [TypeOrmModule],

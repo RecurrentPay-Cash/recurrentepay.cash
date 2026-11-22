@@ -10,6 +10,7 @@ import { DataSource, type QueryRunner } from 'typeorm';
 import { CreateNotificationWebhook1700000000003 } from '../src/db/migrations/1700000000003-create-notification-webhook.js';
 import { CreateScheduledCancel1700000000004 } from '../src/db/migrations/1700000000004-create-scheduled-cancel.js';
 import { AddPolicyWarnedAt1700000000005 } from '../src/db/migrations/1700000000005-add-policy-warned-at.js';
+import { CreateOffchain1700000000006 } from '../src/db/migrations/1700000000006-create-offchain.js';
 
 describe('migration 1700000000003 (notification/webhook/auto_cancel_policy)', () => {
   let dataSource: DataSource;
@@ -67,7 +68,10 @@ function statementsFor(postgresStatements: string[]): string[] {
   return postgresStatements.map((sql) =>
     sql
       .replace(/"id" serial PRIMARY KEY/, '"id" integer PRIMARY KEY')
-      .replace(/timestamptz NOT NULL DEFAULT now\(\)/g, 'datetime NOT NULL DEFAULT CURRENT_TIMESTAMP'),
+      .replace(/timestamptz NOT NULL DEFAULT now\(\)/g, 'datetime NOT NULL DEFAULT CURRENT_TIMESTAMP')
+      // SQLite has no `CREATE UNIQUE INDEX ... ON "table" ("col")` difference,
+      // but `serial`-style tables need the index kept as-is; nothing to rewrite.
+      .replace(/CREATE UNIQUE INDEX "IDX_account_pkh" ON "account" \("pkh"\)/, 'CREATE UNIQUE INDEX "IDX_account_pkh" ON "account" ("pkh")'),
   );
 }
 
@@ -156,5 +160,62 @@ async function captureUp3(): Promise<string[]> {
     },
   } as unknown as QueryRunner;
   await new CreateNotificationWebhook1700000000003().up(recorder);
+  return recorded;
+}
+
+describe('migration 1700000000006 (off-chain: account / channel / plan / subscription_link)', () => {
+  let dataSource: DataSource;
+  let queryRunner: QueryRunner;
+
+  beforeAll(async () => {
+    dataSource = new DataSource({ type: 'better-sqlite3', database: ':memory:' });
+    await dataSource.initialize();
+    queryRunner = dataSource.createQueryRunner();
+  });
+
+  afterAll(async () => {
+    await dataSource.destroy();
+  });
+
+  it('round-trips up then down without throwing', async () => {
+    const migration = new CreateOffchain1700000000006();
+
+    for (const statement of statementsFor(await captureUp6(migration))) {
+      await queryRunner.query(statement);
+    }
+    const upTables = await tables(queryRunner);
+    expect(upTables).toEqual(
+      expect.arrayContaining(['account', 'channel', 'plan', 'subscription_link']),
+    );
+
+    // The account identity is the pkh, and it is unique — the column that makes
+    // a hash collision impossible (Slice 6 review Major 1).
+    const accountCols = (await queryRunner.query(
+      `PRAGMA table_info("account")`,
+    )) as Array<{ name: string }>;
+    expect(accountCols.map((c) => c.name)).toContain('pkh');
+    const uniqueIdx = (await queryRunner.query(
+      `SELECT name FROM sqlite_master WHERE type='index' AND name='IDX_account_pkh'`,
+    )) as Array<{ name: string }>;
+    expect(uniqueIdx).toHaveLength(1);
+
+    await expect(migration.down(queryRunner)).resolves.toBeUndefined();
+    const downTables = await tables(queryRunner);
+    expect(downTables).not.toEqual(
+      expect.arrayContaining(['account', 'channel', 'plan', 'subscription_link']),
+    );
+  });
+});
+
+/** Run migration 1700000000006's `up` against a recorder. */
+async function captureUp6(migration: CreateOffchain1700000000006): Promise<string[]> {
+  const recorded: string[] = [];
+  const recorder = {
+    query: async (sql: string) => {
+      recorded.push(sql);
+      return [];
+    },
+  } as unknown as QueryRunner;
+  await migration.up(recorder);
   return recorded;
 }

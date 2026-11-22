@@ -13,7 +13,8 @@
     "start": "node --experimental-strip-types src/main.ts",
     "dev": "node --watch --experimental-strip-types src/main.ts",
     "test": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js --config jest.config.mjs",
-    "migration:run": "node --experimental-strip-types src/db/run-migrations.ts"
+    "migration:run": "tsx src/db/run-migrations.ts",
+    "seed:demo": "tsx src/offchain/seed-demo.ts"
   },
   "dependencies": {
     "@bitauth/libauth": "3.1.0-next.8",
@@ -39,6 +40,7 @@
     "jest": "29.7.0",
     "supertest": "7.3.2",
     "ts-jest": "29.2.5",
+    "tsx": "^4.23.15",
     "typescript": "5.7.2"
   }
 }
