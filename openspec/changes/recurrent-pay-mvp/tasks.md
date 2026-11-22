@@ -278,18 +278,38 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
   — **Slice 5:** `cancel` + `scheduled_cancel` tables (migration
   `1700000000004-create-scheduled-cancel.ts`; entities registered in data-source /
   database.module / run-migrations; up/down round-trip tested)
-- [ ] 8.15 **Off-chain channel/plan CRUD** — authenticated create/edit/hide for a creator's channel
+  — **Slice 6:** `account`, `channel`, `plan`, `subscription_link` tables (migration
+  `1700000000006-create-offchain.ts`; entities registered in data-source /
+  database.module / run-migrations; up/down round-trip tested)
+- [x] 8.15 **Off-chain channel/plan CRUD** — authenticated create/edit/hide for a creator's channel
   and plans; plan data API for the wizard; write the subscription-link on creation
+  — **Slice 6:** `OffchainModule` (`offchain.service.ts`, `offchain.controller.ts`,
+  `account/channel/plan/subscription-link.repository.ts`). Authenticated `/offchain/*` CRUD;
+  caller pkh → creator account (lazy; **keyed on the exact pkh, unique column** — Slice 6 review
+  Major 1); **soft-delete only** (`DELETE /offchain/plans/:id` sets `visible = false` — never
+  hard-deleted); public `GET /offchain/plan-data` seeds the wizard and **fails closed** on an
+  invalid `channelId`; `POST /offchain/subscriptions/:subscriptionId/link` (authenticated, caller
+  must be a party to the sub and own the plan's channel) writes the plan → sub link and records the
+  supporter's account. Tests: `offchain.test.ts` (create/edit/hide, 401, cross-creator 403, hidden
+  plan keeps linked subs valid, link route, pkh-collision regression, plan-data fail-closed).
 - [x] 8.16 **Future-periods computation** — expose `floor(escrow / amount)` per subscription
   — **Slice 1:** the pure computation + unit tests (API exposure in Slice 4)
   — **Slice 4:** exposed as `futurePeriods` on `GET /subscriptions` and `GET /subscriptions/:id`
 - [ ] 8.17 **Mutual-consent relay** — store/notify a `modify`/`migrate` proposal, track signatures,
   rebuild (never replay) at signing, broadcast on both-present; fee = initiator; expiry (24h) + revoke
-- [ ] 8.18 **Subscription filtering** — by channel / state / plan (basic; full matrix post-MVP)
+- [x] 8.18 **Subscription filtering** — by channel / state / plan (basic; full matrix post-MVP)
   — **Slice 4:** `state` and `role` filters land with the API (both tested);
   `channel`/`plan` filters fail-closed until the `subscription_link` table lands
   (Slice 6); README documents the fail-closed behavior
-- [ ] 8.19 **Judge demo seed** — mock channels/plans/subs (task, not a requirement)
+  — **Slice 6:** `channel`/`plan` filters now join through `subscription_link`
+  (`OffchainService.linkedSubscriptionIds`); an unknown channel/plan still yields `[]`
+  (fail-closed); the two filters combine with **AND** (Slice 6 review Minor 2). Tests:
+  `filtering.test.ts` (channel, plan, channel+state, channel+plan AND, unknown channel).
+- [x] 8.19 **Judge demo seed** — mock channels/plans/subs (task, not a requirement)
+  — **Slice 6:** `DemoSeedService.seed()` + `pnpm --filter txserver seed:demo`
+  (`src/offchain/seed-demo.ts`); creates a mock channel + plans, **idempotent**
+  (keys on channel/plan title). Tests: `demo-seed.test.ts` (creates, running twice does not
+  duplicate).
 
 ### 9. Web app (Next.js)
 - [ ] 9.1 Scaffold Next.js + Tailwind; design system pass (impeccable: PRODUCT.md/DESIGN.md)
