@@ -20,7 +20,7 @@ import {
 import { SEED } from './commitment.js';
 
 /** Derived status of a subscription (spec § Derived state in Postgres). */
-export type SubscriptionStatus = 'active' | 'paused' | 'due' | 'canceled';
+export type SubscriptionStatus = 'active' | 'paused' | 'due' | 'canceled' | 'degraded';
 
 export interface DerivedState {
   /** Elapsed periods at `now` (`n`). */

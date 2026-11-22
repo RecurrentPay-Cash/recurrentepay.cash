@@ -3,6 +3,7 @@ import {
   decodeCommitment,
   deriveEscrow,
   deriveState,
+  oracle,
   type SubscriptionState,
   type WatchedUtxo,
 } from 'shared';
@@ -18,6 +19,8 @@ export interface WatchedSubscription {
   /** The covenant address locking bytecode (hex). */
   covenantAddress: string;
   assetType?: 'token' | 'oracle';
+  /** Oracle subs only: the pubkey mapped from the commitment's `oraclePkHash`. */
+  oraclePubkey?: string | null;
 }
 
 export interface RefreshResult {
@@ -56,6 +59,10 @@ export class DerivedStateService {
    */
   async refresh(sub: WatchedSubscription, now: number): Promise<RefreshResult> {
     const utxos = await this.watcher.getUtxos(sub.covenantAddress);
+
+    if (sub.assetType === 'oracle') {
+      return this.refreshOracle(sub, utxos, now);
+    }
 
     const lockingBytecodeByOutpoint: Record<string, string> = {};
     for (const u of utxos) {
@@ -102,6 +109,79 @@ export class DerivedStateService {
   private decodeState(utxo: WatchedUtxo | undefined): SubscriptionState | undefined {
     if (utxo?.commitment === undefined) return undefined;
     return decodeCommitment(hexToBytes(utxo.commitment));
+  }
+
+  /**
+   * Oracle (BCH) derived state: the covenant is a **single UTXO** — the mutable
+   * state NFT and the satoshis share one output, so the balance is that output's
+   * value and `spendable = balance − DUST` (no escrow, no seed).
+   *
+   * The settle price is the **stored `lastRate`** (no live oracle fetch here — a
+   * stale rate only affects the cached status, never a broadcast tx; the pull
+   * executor fetches a fresh message). Status is balance-gated
+   * (`balance ≥ payable`), never clock-gated (design.md § Content gating).
+   */
+  private async refreshOracle(
+    sub: WatchedSubscription,
+    utxos: WatchedUtxo[],
+    now: number,
+  ): Promise<RefreshResult> {
+    const stateUtxo = utxos.find(
+      (u) => u.category === sub.stateCategory && u.nftCapability !== undefined,
+    );
+    const state =
+      stateUtxo?.commitment === undefined
+        ? undefined
+        : oracle.decodeCommitment(hexToBytes(stateUtxo.commitment));
+
+    const balance = stateUtxo?.satoshis ?? 0n;
+    const settlement =
+      state === undefined
+        ? undefined
+        : oracle.settleOracle(state, balance - oracle.DUST, now, BigInt(state.lastRate));
+
+    let status: string;
+    let nextPaymentAt: number | null;
+    if (state === undefined || settlement === undefined) {
+      status = 'canceled';
+      nextPaymentAt = null;
+    } else {
+      nextPaymentAt = state.lastPeriodTime + state.period;
+      if (balance < settlement.payable) {
+        status = 'paused';
+      } else if (settlement.m > 0n || now >= nextPaymentAt) {
+        status = 'due';
+      } else {
+        status = 'active';
+      }
+    }
+
+    const row: SubscriptionUpsert = {
+      stateCategory: sub.stateCategory,
+      stateOutpoint: outpoint(stateUtxo),
+      escrowOutpoint: null,
+      assetType: 'oracle',
+      fundsCategory: sub.fundsCategory,
+      mode: state?.mode ?? 0,
+      supporterPkh: hex(state?.supporterPkh),
+      supporteePkh: hex(state?.supporteePkh),
+      servicePkh: hex(state?.servicePkh),
+      amount: state?.amount ?? 0n,
+      amountNext: state?.amountNext ?? 0n,
+      period: state?.period ?? 0,
+      periodNext: state?.periodNext ?? 0,
+      lastPeriodTime: state?.lastPeriodTime ?? 0,
+      // Sats-based balance (the single UTXO's value).
+      escrowBalance: balance,
+      status,
+      nextPaymentAt,
+      oraclePkHash: state === undefined ? null : hex(state.oraclePkHash),
+      oraclePubkey: sub.oraclePubkey ?? null,
+      lastRate: state?.lastRate ?? null,
+    };
+
+    await this.repository.upsert(row);
+    return { row, strayFunds: [], foreignTokens: [] };
   }
 }
 

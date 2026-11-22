@@ -1,6 +1,7 @@
 import { Entity, PrimaryColumn, Column, CreateDateColumn, UpdateDateColumn, Index } from 'typeorm';
 import { covenantLockingBytecode, toInternalCategory } from 'shared';
-import artifact from 'contracts/artifacts/token-subscription.artifact.js';
+import tokenArtifact from 'contracts/artifacts/token-subscription.artifact.js';
+import oracleArtifact from 'contracts/artifacts/oracle-subscription.artifact.js';
 
 /** Asset type of a subscription — token subs are exercised in Slice 1. */
 export type AssetType = 'token' | 'oracle';
@@ -105,8 +106,14 @@ export class Subscription {
    * The covenant address (P2SH32 locking bytecode hex) for this subscription:
    * `f(stateCategory)`. Derived, not stored — the covenant lock is a pure
    * function of the state category (design.md § Creation).
+   *
+   * Artifact-aware: the token and oracle contracts are different scripts, so the
+   * address depends on `assetType`. The wrong artifact resolves the wrong
+   * address and every downstream path (derived state, pull, cancel, discovery)
+   * reads the wrong UTXO set.
    */
   covenantAddress(): string {
+    const artifact = this.assetType === 'oracle' ? oracleArtifact : tokenArtifact;
     return covenantLockingBytecode(toInternalCategory(this.stateCategory), artifact.bytecode);
   }
 }

@@ -16,14 +16,16 @@ import { ElectrumNetworkProvider, MockNetworkProvider, type NetworkProvider } fr
 import type { AppConfig } from '../config.js';
 import { Pull } from '../db/pull.entity.js';
 import { SubscriptionModule } from '../subscription/subscription.module.js';
+import { OracleModule } from '../oracle/oracle.module.js';
 import { PullRepository } from './pull.repository.js';
 import { PullExecutorService, type PullExecutorConfig } from './pull-executor.service.js';
+import { OraclePullExecutorService } from './oracle-pull-executor.service.js';
 
 export const PULL_NETWORK_PROVIDER = 'PULL_NETWORK_PROVIDER';
 export const PULL_EXECUTOR_CONFIG = 'PULL_EXECUTOR_CONFIG';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([Pull]), SubscriptionModule],
+  imports: [TypeOrmModule.forFeature([Pull]), SubscriptionModule, OracleModule],
   providers: [
     {
       provide: PULL_NETWORK_PROVIDER,
@@ -46,7 +48,8 @@ export const PULL_EXECUTOR_CONFIG = 'PULL_EXECUTOR_CONFIG';
     },
     PullRepository,
     PullExecutorService,
+    OraclePullExecutorService,
   ],
-  exports: [PullRepository, PullExecutorService],
+  exports: [PullRepository, PullExecutorService, OraclePullExecutorService],
 })
 export class PullModule {}

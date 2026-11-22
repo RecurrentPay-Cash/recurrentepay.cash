@@ -10,3 +10,6 @@ export * from './commitment.js';
 export * from './escrow.js';
 export * from './fee.js';
 export * from './derived-state.js';
+// Namespaced: the oracle names (`MODE`, `DUST`, `perPeriodFee`, `encodeCommitment`)
+// collide with the token ones, so they must not be flattened into this module.
+export * as oracle from './oracle.js';

@@ -24,9 +24,16 @@ import {
   type WatchedSubscription,
 } from '../subscription/derived-state.service.js';
 import type { Subscription } from '../db/subscription.entity.js';
-import { SubscriptionRepository } from '../subscription/subscription.repository.js';
+import {
+  SubscriptionRepository,
+  type SubscriptionUpsert,
+} from '../subscription/subscription.repository.js';
 import { PullExecutorService } from '../pull/pull-executor.service.js';
 import type { PullResult } from '../pull/pull-executor.service.js';
+import {
+  OraclePullExecutorService,
+  OraclePullDeferredError,
+} from '../pull/oracle-pull-executor.service.js';
 import type { ScheduledCancelService } from '../cancel/scheduled-cancel.service.js';
 import type { AutoCancelService } from '../cancel/auto-cancel.service.js';
 import type { MutualConsentService } from '../relay/mutual-consent.service.js';
@@ -80,6 +87,7 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
     @Optional() private readonly scheduledCancel?: ScheduledCancelService,
     @Optional() private readonly autoCancel?: AutoCancelService,
     @Optional() private readonly relay?: MutualConsentService,
+    @Optional() private readonly oracleExecutor?: OraclePullExecutorService,
   ) {}
 
   /** Register a notification listener; returns an unsubscribe function. */
@@ -180,7 +188,10 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
       }
 
       try {
-        const result = await this.executor.executePull(fresh, { now });
+        const result =
+          fresh.assetType === 'oracle'
+            ? await this.oracleExecutor!.executeOraclePull(fresh, { now })
+            : await this.executor.executePull(fresh, { now });
         if (result.broadcast) {
           pulled.push(result);
           this.emit({
@@ -203,6 +214,13 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
         // fatal: the next cycle re-reads state. Log and move on.
         this.logger.warn(`pull failed for ${fresh.stateCategory}: ${(error as Error).message}`);
         skipped.push(fresh.stateCategory);
+        // A non-fresh oracle message defers the pull: mark the sub degraded and
+        // retry next cycle. Never broadcast a stale/partial tx.
+        if (error instanceof OraclePullDeferredError) {
+          await this.repository
+            .upsert({ ...this.toUpsert(fresh), status: 'degraded' })
+            .catch(() => undefined);
+        }
       }
     }
 
@@ -264,6 +282,34 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
       stateCategory: row.stateCategory,
       fundsCategory: row.fundsCategory,
       covenantAddress: row.covenantAddress(),
+      assetType: row.assetType,
+      oraclePubkey: row.oraclePubkey,
+    };
+  }
+
+  /** Map a stored row back to an upsert payload (used to patch `status`). */
+  private toUpsert(row: Subscription): SubscriptionUpsert {
+    return {
+      stateCategory: row.stateCategory,
+      stateOutpoint: row.stateOutpoint,
+      escrowOutpoint: row.escrowOutpoint,
+      assetType: row.assetType,
+      fundsCategory: row.fundsCategory,
+      mode: row.mode,
+      supporterPkh: row.supporterPkh,
+      supporteePkh: row.supporteePkh,
+      servicePkh: row.servicePkh,
+      amount: BigInt(row.amount),
+      amountNext: BigInt(row.amountNext),
+      period: row.period,
+      periodNext: row.periodNext,
+      lastPeriodTime: row.lastPeriodTime,
+      escrowBalance: BigInt(row.escrowBalance),
+      status: row.status,
+      nextPaymentAt: row.nextPaymentAt,
+      oraclePkHash: row.oraclePkHash,
+      oraclePubkey: row.oraclePubkey,
+      lastRate: row.lastRate,
     };
   }
   private emit(event: NotificationEvent): void {
