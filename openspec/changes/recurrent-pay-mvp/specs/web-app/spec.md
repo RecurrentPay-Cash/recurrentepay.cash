@@ -105,8 +105,9 @@ through the notices below, never as a separate balance line.
 ### Requirement: Actions (top-up, cancel, modify, transfer)
 The app SHALL support: top-up (fund tx, **active subs only**), cancel (boundary-gated — a cancel
 initiated mid-period does **not** take effect immediately; it is scheduled and executes at the
-period boundary), modify (amount/period terms; oracle change), and pkh transfer (self-service, with
-strong confirmation UX explaining what the new address will control).
+period boundary), modify (amount/period terms), migrate (asset swap for token subs; oracle-key
+swap for BCH subs — mutual, or service-initiated for emergency recovery), and pkh transfer
+(self-service, with strong confirmation UX explaining what the new address will control).
 
 Top-up SHALL be offered only on **active** subscriptions. On a paused sub the app SHALL hide the
 top-up action and redirect the supporter to **reactivate** instead, and SHALL never build a fund
