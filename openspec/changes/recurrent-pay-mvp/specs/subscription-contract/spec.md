@@ -5,14 +5,21 @@ Two contracts: `oracle-subscription.cash` (BCH, USD-denominated via oracles.cash
 Reference: design.md § Contract State Model and § Functions — `gate → settle → delta`.
 
 > **Build order:** the **token contract first** (no oracle — `settle()` is pure arithmetic).
-> The oracle contract is blocked on the `settle()` oracle-coupling decision (design.md
-> § Oracle coupling of `settle()`) — resolve before writing it.
+> The oracle contract's `settle()` oracle-coupling is **resolved** (design.md § Oracle coupling of
+> `settle()`): most paths price at the current oracle, `cancel` and service `migrate` price at a
+> stored `lastRate`. The oracle contract can now be written.
 
 > **Revision (Nov 16).** Escrow identity via the co-created outpoint, the 1-unit seed,
 > foreign-token cleanup and consolidation, the `reactivate` redesign, and the service fee.
 > Three points supersede earlier text: the settlement **balance is the escrow only** (never
 > `totalIn`); `reactivate` **no longer invokes `settle()`**; and `n-period catch-up` is written
 > **`m-period catch-up`** (`n` = elapsed, `m` = paid).
+
+> **Revision (Nov 21) — oracle coupling resolved.** The oracle contract prices most paths at the
+> current oracles.cash feed and the exit/recovery paths (`cancel`, service `migrate`) at a stored
+> `lastRate`; the oracle key is stored as `oraclePkHash` (`hash160`, 20 B) with the pubkey passed
+> as an unlock arg; the oracle commitment is 113 B (fields 1–11). See the requirements below and
+> design.md § Oracle coupling of `settle()`.
 
 ## ADDED Requirements
 
@@ -137,6 +144,14 @@ NFT), so an arbitrary funds-category UTXO cannot be substituted for it.
 > in the same output — so there is nothing to co-create and no seed to hold; the single-UTXO
 > requirement replaces both. The oracle contract enforces the same *balance discipline*
 > (`m` from its own input's value, never a transaction-wide sum), but not co-creation.
+>
+> **DUST reserve (oracle equivalent of the seed).** The single-UTXO oracle contract SHALL retain a
+> **dust reserve `DUST`** (a contract constant, initial value **1000 sats**) on the state output,
+> so the covenant always leaves a valid output behind. The settlement balance is
+> `spendable = balance − DUST`, exactly as the token contract uses `spendable = escrow − seed`.
+> `DUST` is the single-UTXO analogue of the token seed: it makes "the covenant still exists"
+> unconditional. It is a **separate** constant from `MIN_FEE_PER_PERIOD` (the two share the value
+> 1000 by coincidence). No 1-unit token seed is held — the reserve is sats, not a token unit.
 
 The settlement **balance SHALL be the escrow's amount only** (`escrow`), never the sum of all
 funds-category inputs in the transaction. A stray funds-category UTXO (created by a separate
@@ -180,6 +195,12 @@ is present" is always checkable.
 - **GIVEN** a subscription whose spendable balance is fully withdrawn
 - **THEN** the covenant retains the 1-unit seed and the state NFT and escrow stay co-created
 - **AND WHEN** `cancel` executes, the seed is refunded to the supporter
+
+> **Oracle sub analogue:** the scenarios above are written for the **token** contract (co-creation,
+> 1-unit seed). For the single-UTXO **oracle** contract the analogues are: the settlement balance is
+> the state input's own value (never a transaction-wide sum); the **`DUST` reserve** (1000 sats)
+> survives a full withdraw in place of the seed (it is not refunded at cancel — it is the retained
+> output that keeps the covenant alive); and a stray BCH input is never counted as balance.
 
 ### Requirement: Foreign-token cleanup and consolidation
 Token-bearing outputs SHALL be permitted only in these roles: the state output (state category →
@@ -273,6 +294,13 @@ NOT be rebuilt (the category would change and `C` would reference a dead UTXO). 
 - **GIVEN** a creation transaction whose escrow holds only the seed
 - **WHEN** the txserver validates the genesis transaction
 - **THEN** it refuses to track the subscription (the `amount + seed` minimum is not met)
+
+#### Scenario: Oracle subscription seeds lastRate at creation
+- **GIVEN** an oracle (BCH) subscription creation
+- **WHEN** the creation transaction is built
+- **THEN** it carries an oracle message and stores `lastRate` = that message's `price`, so a service
+  `cancel` before the first `pull` still prices correctly (the BCH sub is a **single UTXO** — no
+  escrow to co-create and no seed to hold)
 
 ### Requirement: Creation covenant (factory) — MVP stretch goal
 The optional **factory** covenant SHALL lock the carrier's output 0 and enforce the creation rules
@@ -373,6 +401,112 @@ retained, `escrow − paid ≥ seed ≥ 1` always — the funds output is **alwa
 - **THEN** exactly one settlement occurs, and the next boundary is at most one period away
   (no immediate re-pull)
 
+### Requirement: Oracle contract — rate sources and coupling
+The oracle (BCH) contract SHALL price USD amounts in satoshis via an oracles.cash (General
+Protocols) price feed. It SHALL use the **current oracle** for `pull`, `reactivate`, mutual
+`migrate` and `withdraw`, and a stored **`lastRate`** for `cancel` and service `migrate`. The
+oracle public key SHALL be stored in the commitment as `oraclePkHash` (`hash160(oraclePk)`, 20 B,
+field 10); the full pubkey SHALL be passed as an **unlock arg** and verified with
+`require(hash160(pubkey) == oraclePkHash)` before `checkDataSig`.
+
+`lastRate` (commitment field 11, 4 B) SHALL be the raw little-endian `price` field of the GP
+message (**cents per BCH**). It SHALL be **initialized at creation** (the creation transaction
+carries the first oracle message, so a service `cancel` before the first `pull` still works),
+**written by every oracle-priced settle** (`pull`, `reactivate`, mutual `migrate`, `withdraw`),
+and **read but never written** by `cancel` and service `migrate`.
+
+**Migrate authorization SHALL be `supporter + supportee` OR `service`:** both parties present →
+mutual path, oracle-priced; only the service present → recovery path, `lastRate`-priced, swapping
+the oracle. `withdraw` is **not** an exit path (it reclaims over-funding) and SHALL remain
+oracle-priced.
+
+#### Scenario: USD conversion at pull time
+- **GIVEN** amount = $10, m = 1, oracle price = $500/BCH
+- **WHEN** a pull executes
+- **THEN** the gross supportee output is 0.02 BCH (2,000,000 sats), from which the service fee is
+  split off, and `lastRate` is written as 50000 (cents/BCH)
+
+#### Scenario: Cancel prices at the stored rate (dead oracle)
+- **GIVEN** a subscription whose oracle has stopped publishing, with `lastRate` = 50000
+- **WHEN** any present party (supporter, supportee, or service) cancels at the boundary
+- **THEN** the settlement prices at `lastRate` (no oracle message required), the supportee is paid
+  what is due, and the remainder (seed + strays) is refunded to the supporter
+
+#### Scenario: Service migrate recovers a dead oracle
+- **GIVEN** a BCH subscription whose oracle is failing
+- **WHEN** the service alone migrates to a new `oraclePkHash` at `lastRate`
+- **THEN** the settle uses `lastRate`, the commitment stores the new `oraclePkHash`, and the next
+  `pull` verifies against the new oracle
+
+#### Scenario: Mutual migrate uses the current oracle
+- **GIVEN** a BCH subscription with a live oracle
+- **WHEN** supporter and supportee both migrate
+- **THEN** the settle prices at the current oracle and `lastRate` is updated
+
+#### Scenario: Withdraw requires a live oracle
+- **GIVEN** a subscription whose oracle is dead
+- **WHEN** the supporter attempts `withdraw`
+- **THEN** the contract rejects the transaction (no message available); the supporter exits via
+  `cancel` instead, or waits for the service to migrate
+
+#### Scenario: Reactivate funds the future at the current rate
+- **GIVEN** a paused subscription with a live oracle
+- **WHEN** the supporter reactivates
+- **THEN** the arrears sweep (`escrow − seed`) is oracle-free, but the gate (`newFunds ≥
+  amountNext`) and the fresh period are priced at the **current** oracle rate, and `lastRate` is
+  updated
+
+### Requirement: Oracle message verification and freshness
+The oracle contract SHALL verify the oracles.cash (General Protocols) 16-byte message with
+`checkDataSig` against the pubkey whose `hash160` matches `oraclePkHash`. The message layout is
+`messageTimestamp(4) ‖ messageSequence(4) ‖ contentSequence(4) ‖ price(4)`, all uint32
+little-endian. The verify helper SHALL enforce:
+
+- `require(messageTimestamp <= tx.locktime)` — reject a future-dated message;
+- `require(messageTimestamp >= lastPeriodTime + n·period)` — the price is from the **current
+  period** (the period being settled);
+- `require(tx.locktime − messageTimestamp <= FRESHNESS)` — not stale; caps rate-selection;
+- `require(contentSequence > 0)` — reject metadata messages.
+
+`FRESHNESS` SHALL be an absolute constant (default **1 hour**). The effective rate-selection
+window is `[max(periodStart, tx.locktime − FRESHNESS), tx.locktime]`, so the submitter's
+rate-choice power is `min(timeIntoPeriod, FRESHNESS) ≤ min(period, FRESHNESS)` — never more than
+`FRESHNESS`, regardless of period length. These bounds SHALL be checked only by oracle-priced
+paths (`pull`, `reactivate`, mutual `migrate`, `withdraw`); `cancel` and service `migrate` carry
+no message and no bound.
+
+#### Scenario: Stale oracle message rejected
+- **GIVEN** an oracle message older than `FRESHNESS` relative to `tx.locktime`
+- **WHEN** an oracle-priced function includes only that message
+- **THEN** the contract rejects the transaction
+
+#### Scenario: Future-dated message rejected
+- **GIVEN** an oracle message whose `messageTimestamp` is after `tx.locktime`
+- **WHEN** an oracle-priced function includes it
+- **THEN** the contract rejects the transaction
+
+#### Scenario: Message from an earlier period rejected
+- **GIVEN** a subscription settling period `n`, and a message whose `messageTimestamp` is before
+  `lastPeriodTime + n·period`
+- **WHEN** the function is evaluated
+- **THEN** the contract rejects the transaction (the price is not from the current period)
+
+#### Scenario: Metadata message rejected
+- **GIVEN** a GP message with `contentSequence <= 0`
+- **WHEN** an oracle-priced function includes it
+- **THEN** the contract rejects the transaction
+
+#### Scenario: Wrong oracle key rejected
+- **GIVEN** an unlock arg pubkey whose `hash160` does not equal the commitment's `oraclePkHash`
+- **WHEN** the function is evaluated
+- **THEN** the contract rejects the transaction
+
+#### Scenario: Selection window is bounded by the period for short periods
+- **GIVEN** a half-hour period subscription (`period < FRESHNESS`)
+- **WHEN** an oracle-priced function is evaluated
+- **THEN** the accepted window is at most one period wide (the period bound dominates), so
+  freshness never binds
+
 ### Requirement: Pull destination enforcement (oracle contract)
 The oracle (BCH) contract SHALL pay the supportee exactly
 `m × amount × 1e8 / oraclePrice − fee` satoshis, verified against an oracles.cash `checkDataSig`
@@ -385,18 +519,6 @@ message, and SHALL send the result to the output matching the supportee pkh. The
 - **WHEN** a pull executes
 - **THEN** the gross supportee output is 0.02 BCH (2,000,000 sats), from which the service fee is
   split off
-
-#### Scenario: Stale oracle message rejected
-- **GIVEN** an oracle message older than the configured freshness bound
-- **WHEN** a pull includes only that message
-- **THEN** the contract rejects the transaction
-
-#### Scenario: Cancel under a dead oracle (pending decision)
-- **GIVEN** a subscription whose oracle has stopped publishing
-- **WHEN** any present party (supporter, supportee, or service) cancels at the boundary
-- **THEN** the outcome depends on the oracle-coupling decision (design.md § Oracle coupling of
-  `settle()`): option (a) requires an oracle message, option (b) allows a no-oracle cancel that
-  forfeits unclaimed periods, option (c) pays a fixed-sats escrow without re-pricing
 
 ### Requirement: Pull destination enforcement (token contract)
 The token contract SHALL pay the supportee exactly `m · amount − fee` units of the subscription's
@@ -441,12 +563,14 @@ state NFT.
 ### Requirement: Modify (mutual consent, always-replace)
 The `modify` function SHALL require the escrow input and presence of supporter and supportee,
 SHALL NOT change `lastPeriodTime`, SHALL write `amountNext` and `periodNext` (applied at the next
-promotion: `pull` or `reactivate`), and SHALL allow immediate `oraclePk` changes and `setPkh`-style
-pkh updates via their own paths. `amountNext`/`periodNext` SHALL be written only by mutual consent
+promotion: `pull` or `reactivate`), and SHALL allow `setPkh`-style pkh updates via their own paths.
+`amountNext`/`periodNext` SHALL be written only by mutual consent
 (`modify`/`migrate`); `amount`/`period` SHALL be written only by **promotion** (`pull`,
 `reactivate`) or `migrate` (mutual re-denomination) — no unilateral action SHALL invent a rate,
 but promotion may realise one the supportee already agreed to.
 Token subscriptions SHALL NOT change `fundsCategory` via `modify` (asset change is `migrate`).
+The oracle key (`oraclePkHash`) SHALL NOT change via `modify` either — it changes via `migrate`
+(mutual or service), so the swap always settles first (see § Oracle contract — rate sources).
 
 #### Scenario: Period change does not delay the next payout
 - **GIVEN** period = 7d, changed to 30d on day 6
@@ -494,6 +618,11 @@ update the asset config and re-denominate `amount`/`amountNext` by mutual agreem
 run a second settlement. Because `settle()` has already paid what is due, only the **unearned
 remainder** (the next period's escrow, or nothing if the sub is exactly settled) is migrated.
 
+On the **oracle contract** there is no asset swap: `migrate` swaps the oracle key (`oraclePkHash`)
+instead, and its authorization is **`supporter + supportee` OR `service`** — both present → the
+mutual path, `settle()` at the **current oracle**; only the service present → the recovery path,
+`settle()` at **`lastRate`** (no oracle message). See § Oracle contract — rate sources.
+
 The **settle-then-swap** order is deliberate: arrears were earned under the old terms, so they
 are paid in the old asset before the swap; a price crash is a market risk the supportee accepted
 when they agreed to that asset. Alternatives considered and rejected are recorded in design.md
@@ -518,9 +647,10 @@ when they agreed to that asset. Alternatives considered and rejected are recorde
 
 #### Scenario: Oracle change for emergency
 - **GIVEN** a BCH subscription whose oracle is failing
-- **WHEN** both parties migrate to a new oracle public key
-- **THEN** the next pull verifies against the new oracle (subject to the oracle-coupling
-  decision — see design.md § Oracle coupling of `settle()`)
+- **WHEN** the service alone migrates to a new `oraclePkHash` (or both parties migrate)
+- **THEN** the settle uses `lastRate` (service path) or the current oracle (mutual path), the next
+  pull verifies against the new oracle, and `lastRate` is unchanged by the service path (no
+  oracle message) — see § Oracle contract — rate sources and design.md § Oracle coupling of `settle()`
 
 ### Requirement: Fund (permissionless top-up)
 The `fund` function SHALL require the escrow input, SHALL allow anyone to add funds to the
@@ -587,6 +717,13 @@ The new funds arrive locked to the supporter's address and are re-locked to the 
 stray funds UTXO, if included, counts as `newFunds` (it is genuinely new money for this sub) and
 is absorbed into the escrow on recreation.
 
+> **Oracle (single-UTXO) form.** The oracle contract has no funds category, so `newFunds` is the
+> fresh BCH locked into the covenant in this transaction: `newFunds = state_output.value −
+> covenant_input.value` (the state output's value minus the covenant's own input value). Unlike the
+> token contract there is no separate escrow UTXO; the covenant re-locks `balance + newFunds` (minus
+> the mode-A prepaid period). The gate becomes `newFunds ≥ grossPerPeriod(amountNext, price)`. This
+> is the single-UTXO analogue and the only definition the oracle contract enforces.
+
 Let `amountOld`/`periodOld` be the commitment's values at input and `amountNew`/`periodNew` its
 `amountNext`/`periodNext`. It SHALL:
 
@@ -603,8 +740,10 @@ Let `amountOld`/`periodOld` be the commitment's values at input and `amountNew`/
 6. charge the service fee **per period paid, each at the rate in force when it was paid**:
    `fee = m · perPeriodFee(amountOld) + (mode A ? perPeriodFee(amountNew) : 0)`, where
    `m = floor((escrow − seed) / amountOld)` is the whole arrears periods and
-   `perPeriodFee(x) = max(x · SERVICE_FEE_PERCENT / 100, MIN_FEE_PER_PERIOD)`. Mode B's fresh
-   period is escrowed and pays its fee at the boundary `pull`, never here;
+   `perPeriodFee(x) = max(x · SERVICE_FEE_PERCENT / 100, MIN_FEE_PER_PERIOD)`. **Mode A always
+   charges one fee for the upcoming prepaid period, at the new rate, even when `m = 0`** (the
+   prepaid period *is* a period paid, now). Mode B's fresh period is escrowed and pays its fee at
+   the boundary `pull`, never here, so mode B adds nothing for it regardless of `m`;
 7. recreate the state and funds UTXOs with `contractBalance = seed + (mode A ? newFunds − amount :
    newFunds)` (with `amount` = the **promoted** value).
 
@@ -654,9 +793,20 @@ written only by **promotion** (`pull`, `reactivate`) or `migrate` (re-denominati
 - **GIVEN** a paused sub, mode B, amount 5, seed 1, escrow 4
 - **WHEN** the supporter reactivates with newFunds 5
 - **THEN** the supportee receives `escrow − seed = 3` (the escrow covered no *whole* period, so
-  `m = 0` and no fee is charged now), and the service is paid at the boundary
+  `m = 0` and — **for mode B** — no fee is charged now), and the service is paid at the boundary
 - **AND** the contract balance is `seed + newFunds = 6 ≥ owedPreSettle (5)`; the supportee pulls the
   escrowed period — and pays that period's fee — at the boundary
+
+#### Scenario: Mode A charges the prepaid period's fee even at m = 0
+- **GIVEN** a paused mode A sub, amount 5, seed 1, escrow 4 (`spendable = 3`, `m = 0`), with the
+  upcoming `amountNext = 5` and `perPeriodFee(5) = 1`
+- **WHEN** the supporter reactivates with newFunds 5
+- **THEN** the service receives `perPeriodFee(amountNew) = 1` now — the prepaid upcoming period is
+  a period paid, so its fee is charged at the new rate even though no arrears period was whole
+- **AND** the supportee receives `spendable + amountNew − fee = 3 + 5 − 1 = 7`, and the contract
+  balance is `seed + newFunds − amountNew = 1 + 5 − 5 = 1`
+- **NOTE** this is the intentional distinction from mode B: mode A prepays the *upcoming* period
+  (a period paid now, fee charged now); mode B escrows it (fee charged at the boundary `pull`)
 
 #### Scenario: Mode B with a whole period of arrears covered
 - **GIVEN** a paused sub, mode B, amount 5, seed 1, `perPeriodFee` 1, escrow 12, three periods
@@ -708,7 +858,8 @@ into the contract, not constructor parameters**. A constructor argument rides on
 every spend — the same weight argument that rejected the 2-NFT design (design.md § Architecture
 Decisions) — and a constant is a protocol fact, whereas a param is per-sub mutable state needing
 validation. If a per-sub or tiered fee is ever required, the natural home is a **commitment
-field** (the layout has 7 bytes of headroom), not a constructor argument.
+field** (the token layout has 7 bytes of headroom; the oracle layout has 15), not a constructor
+argument.
 
 > **Unit convention:** the divisor is `/100`, so the constant is a **percent** (value 1 = 1%).
 > If it is ever renamed to basis points, the value must become **100** (`/10000`), not 1 — 1 bps
@@ -800,14 +951,23 @@ values (status, next payment, balance) are resolved by the app, not the NFT.
   by `n · periodOld` (grid-aligned, no drift across repeated reactivates); **promotes terms** (gate
   and fresh period at `amountNext`); fee per period at the rate in force (mode A adds the prepaid
   period at the new rate, mode B does not); mode A re-pauses at the next boundary.
-- `cancel`: settle-then-refund; refund = everything remaining after the NFT burn (seed + strays).
-- `migrate`: settle-then-swap; only the unearned remainder migrates; escrow ≥ `carryOver` + seed.
+- `cancel`: settle-then-refund; refund = everything remaining after the NFT burn (seed + strays);
+  oracle contract: prices at `lastRate` (no oracle message required).
+- `migrate`: settle-then-swap; only the unearned remainder migrates; escrow ≥ `carryOver` + seed;
+  oracle contract: auth `supporter + supportee` OR `service`, mutual path at the current oracle,
+  service path at `lastRate`.
+- **Oracle contract:** rate-source matrix (`pull`/`reactivate`/mutual-migrate/`withdraw` = oracle;
+  `cancel`/service-migrate = `lastRate`); `lastRate` init at creation and written only by
+  oracle-priced settles; freshness bounds (`<= tx.locktime`, `>= lastPeriodTime + n·period`,
+  `<= FRESHNESS`, `contentSequence > 0`); wrong-key rejection via `hash160(pubkey) == oraclePkHash`;
+  dead-oracle matrix (only `cancel` and service `migrate` succeed); cancel/pull rate divergence.
 - **Foreign-token cleanup:** a mis-sent token is routed to the supporter by every function; the
   state NFT cannot be routed out through the cleanup path.
 - Boundary-gate edge cases: exactly at boundary, early by 1 second, after automation downtime.
 - Terms matrix: mode A/B × (amount change, period change, both) × before/after pull.
 - Transfers: all three roles, cross-role rejection, offline transfer.
-- Mock oracle per HodlVault example pattern; assert stale/wrong-key rejection.
+- Mock oracle (GP 16-byte message format) per HodlVault example pattern; assert stale/future/
+  wrong-period/wrong-key rejection.
 - State NFT: created `mutable`, no `minting` NFT for the category; at most one state UTXO per
   category.
 - Stretch: 2-of-2 multisig actor as supporter (presence auth generalization).

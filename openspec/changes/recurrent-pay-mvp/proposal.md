@@ -81,8 +81,11 @@ event and disclosed in the README and submission, per hackathon rules.
 - Service-fee tiers / per-sub fees — the fee is a fixed 1% with a per-period minimum (constants,
   see the contract spec); a per-sub or tiered fee would need a commitment field
 - Oracle-derived cent floor (the oracle contract uses a fixed 1000-sat floor), swap-then-settle
-  migrate, 2-of-3 migrate auth, service-unilateral config change, `pull` participant restriction
-  (see design.md § Migrate ordering — alternatives)
+  migrate, 2-of-3 migrate auth, service-unilateral **terms** change, `pull` participant restriction
+  (see design.md § Migrate ordering — alternatives). **Resolved (Nov 21):** the oracle-coupling
+  decision — most paths price at the current oracle, `cancel` and service `migrate` price at a stored
+  `lastRate`; migrate auth = `supporter + supportee` OR `service`; oracle key stored as
+  `oraclePkHash`. See design.md § Oracle coupling of `settle()`.
 - **Creation covenant (factory), strong version** — the MVP factory (if built) enforces the creation
   rules on-chain but does not recompute the sub address; the strong version embeds a copy of the sub
   script as a literal to verify `hash160(subScript(stateCategory))`, which must be kept in sync with
