@@ -29,6 +29,7 @@ import { PullExecutorService } from '../pull/pull-executor.service.js';
 import type { PullResult } from '../pull/pull-executor.service.js';
 import type { ScheduledCancelService } from '../cancel/scheduled-cancel.service.js';
 import type { AutoCancelService } from '../cancel/auto-cancel.service.js';
+import type { MutualConsentService } from '../relay/mutual-consent.service.js';
 
 /** A notification the scheduler emits (transport is Slice 4). */
 export interface NotificationEvent {
@@ -78,6 +79,7 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
     @Optional() @Inject(SCHEDULER_OPTIONS) private readonly options?: SchedulerOptions,
     @Optional() private readonly scheduledCancel?: ScheduledCancelService,
     @Optional() private readonly autoCancel?: AutoCancelService,
+    @Optional() private readonly relay?: MutualConsentService,
   ) {}
 
   /** Register a notification listener; returns an unsubscribe function. */
@@ -215,6 +217,15 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
     if (this.autoCancel !== undefined) {
       await this.autoCancel.scan(now).catch((error: unknown) => {
         this.logger.warn(`auto-cancel scan failed: ${(error as Error).message}`);
+      });
+    }
+
+    // Expire mutual-consent proposals past their window (spec § Mutual-consent
+    // relay — an expired proposal is not broadcast and both parties are notified).
+    // The counterparty is notified even when they never attempt to sign.
+    if (this.relay !== undefined) {
+      await this.relay.expireDue(now).catch((error: unknown) => {
+        this.logger.warn(`proposal expiry scan failed: ${(error as Error).message}`);
       });
     }
 

@@ -11,10 +11,11 @@ import type { AppConfig } from '../config.js';
 import { SubscriptionModule } from '../subscription/subscription.module.js';
 import { PullModule } from '../pull/pull.module.js';
 import { CancelModule } from '../cancel/cancel.module.js';
+import { RelayModule } from '../relay/relay.module.js';
 import { SchedulerService, SCHEDULER_OPTIONS, type SchedulerOptions } from './scheduler.service.js';
 
 @Module({
-  imports: [SubscriptionModule, PullModule, CancelModule],
+  imports: [SubscriptionModule, PullModule, CancelModule, RelayModule],
   providers: [
     {
       provide: SCHEDULER_OPTIONS,

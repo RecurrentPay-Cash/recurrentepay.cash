@@ -13,6 +13,7 @@ import { OracleModule } from './oracle/oracle.module.js';
 import { NotificationsModule } from './notifications/notifications.module.js';
 import { ApiModule } from './api/api.module.js';
 import { OffchainModule } from './offchain/offchain.module.js';
+import { RelayModule } from './relay/relay.module.js';
 
 /**
  * Root module. Slice 4 adds: party-pkh auth (`/auth/*` + guard), the REST API
@@ -36,6 +37,7 @@ import { OffchainModule } from './offchain/offchain.module.js';
     NotificationsModule,
     ApiModule,
     OffchainModule,
+    RelayModule,
   ],
   controllers: [HealthController],
 })

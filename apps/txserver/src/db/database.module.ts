@@ -14,6 +14,7 @@ import { Account } from './account.entity.js';
 import { Channel } from './channel.entity.js';
 import { Plan } from './plan.entity.js';
 import { SubscriptionLink } from './subscription-link.entity.js';
+import { MutualConsentProposal } from './mutual-consent-proposal.entity.js';
 
 /**
  * Postgres access via TypeORM.
@@ -50,6 +51,7 @@ import { SubscriptionLink } from './subscription-link.entity.js';
             Channel,
             Plan,
             SubscriptionLink,
+            MutualConsentProposal,
           ],
           synchronize: false,
         };
@@ -68,6 +70,7 @@ import { SubscriptionLink } from './subscription-link.entity.js';
       Channel,
       Plan,
       SubscriptionLink,
+      MutualConsentProposal,
     ]),
   ],
   exports: [TypeOrmModule],

@@ -207,4 +207,28 @@ describe('SchedulerService', () => {
     expect(row!.status).toBe('paused');
     off();
   });
+
+  it('expires a due mutual-consent proposal during the scan (M2 wiring)', async () => {
+    // A proposal past its window must be expired by the scheduler cycle even when
+    // the counterparty never attempts to sign (spec § Mutual-consent relay).
+    const expired: number[] = [];
+    const relay = {
+      expireDue: async (now: number): Promise<number> => {
+        expired.push(now);
+        return 1;
+      },
+    } as unknown as import('../src/relay/mutual-consent.service.js').MutualConsentService;
+    const withRelay = new SchedulerService(
+      derived,
+      executor,
+      repository,
+      { intervalMs: 60_000, bufferPercent: 1.05, enabled: false },
+      undefined,
+      undefined,
+      relay,
+    );
+    await withRelay.scanDue(T + DAY);
+    expect(expired).toEqual([T + DAY]);
+    withRelay.onModuleDestroy();
+  });
 });

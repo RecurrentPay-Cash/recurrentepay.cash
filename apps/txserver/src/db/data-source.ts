@@ -11,6 +11,7 @@ import { Account } from './account.entity.js';
 import { Channel } from './channel.entity.js';
 import { Plan } from './plan.entity.js';
 import { SubscriptionLink } from './subscription-link.entity.js';
+import { MutualConsentProposal } from './mutual-consent-proposal.entity.js';
 
 /**
  * Build the TypeORM data source options.
@@ -38,6 +39,7 @@ export function buildDataSourceOptions(
       Channel,
       Plan,
       SubscriptionLink,
+      MutualConsentProposal,
     ],
     migrations: [],
     synchronize: false,

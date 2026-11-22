@@ -58,6 +58,12 @@ store.
 | `PUT` | `/offchain/plans/:id` | Edit a plan on the caller's channel |
 | `DELETE` | `/offchain/plans/:id` | **Hide** a plan (soft-delete; never hard-deleted) |
 | `POST` | `/offchain/subscriptions/:subscriptionId/link` | Link a subscription the caller is a party to, to one of the caller's plans (`{ planId }`) |
+| `POST` | `/subscriptions/:stateCategory/proposals` | Initiate a `modify`/`migrate` proposal (a party to the sub) |
+| `POST` | `/proposals/:id/prepare` | **The counterparty** prepares: the relay returns the unsigned tx + `signableInputs` |
+| `POST` | `/proposals/:id/broadcast` | **The counterparty** relays a client-signed tx (`{ signedHex }`) |
+| `POST` | `/proposals/:id/revoke` | **The initiator** revokes a pending proposal |
+| `GET` | `/proposals/:id` | Read a proposal (party-scoped) |
+| `GET` | `/subscriptions/:stateCategory/proposals` | List a sub's proposals (party-scoped) |
 
 **`channel`/`plan` filters join through `subscription_link`** (Slice 6): filtering by a channel or
 plan returns only the linked subs; an unknown channel/plan yields `[]` (fail-closed, never
@@ -123,6 +129,42 @@ The exit paths are wired and persisted:
   The service key lives **only** in the environment (`SERVICE_KEY`/`SERVICE_PKH`); the platform can
   unilaterally cancel any sub by design (the kill switch).
 
+## Mutual-consent relay (Slice 7)
+
+`modify` and `migrate` require **both parties present in one transaction**, so the txserver relays
+the flow:
+
+- **Propose** — `POST /subscriptions/:stateCategory/proposals` stores a `pending` proposal (terms
+  only, never raw bytes) and notifies the counterparty. The caller is the **initiator** (the
+  supporter or the supportee) and pays the fee.
+- **Prepare** — `POST /proposals/:id/prepare` is the **counterparty's** call. The relay **rebuilds
+  the tx against the current outpoints** (never replays stored bytes) and returns the **unsigned**
+  template (`unsignedHex`) plus the `signableInputs` the client must sign. **Nothing is broadcast.**
+  A proposal is `void` if the sub was terminated or an intervening spend invalidated it.
+- **Broadcast** — `POST /proposals/:id/broadcast` `{ signedHex }` is the **counterparty's** call.
+  The relay **verifies** the signed tx (it decodes; it spends the covenant's *current* state
+  outpoint, re-read live; both presence inputs are present) before relaying it. On success the
+  proposal is `broadcast`; a failed broadcast leaves it `pending` (retryable).
+- **Revoke** — `POST /proposals/:id/revoke` is the **initiator's** call, before the counterparty
+  signs.
+- **Expiry** — a proposal expires after `PROPOSAL_EXPIRY_SECONDS` (default 24h). The scheduler
+  expires due proposals each cycle and notifies both parties (an expired proposal is never
+  prepared or broadcast).
+- **`migrate`** — the token path swaps the escrow's funds category. The caller supplies the
+  new-category token UTXO(s) as `newAssetInputs`; the relay sets `newEscrow = totalIn(newCategory)`
+  (the contract's own accounting) and returns the old-asset remainder to the supporter. The oracle
+  `migrate` (oracle-key swap) is a marked TODO — it needs the oracle contract artifact.
+
+**Client-side signing (security).** The relay **never accepts and never holds a private key**. Each
+party's presence input is supplied as an outpoint + satoshis + P2PKH lock; the covenant's `isPresent`
+only reads the locking bytecode, so the relay assembles a **correctly-sized unsigned placeholder**
+presence input — a 107-byte P2PKH dummy (DER sig push + pubkey push). The size matters: CashScript
+computes the BCH change for the final signed size, so a real signature never under-pays the fee. The
+placeholder is **not valid to broadcast**; the client signs the `signableInputs` (each with
+`SIGHASH_ALL | SIGHASH_FORKID`) and calls `broadcast`. The request body is **whitelisted**
+(`{ txid, vout, satoshis, lockingBytecode }`), so a stray `privateKey` field is dropped and can never
+reach the builder.
+
 ## Notifications + webhook (Slice 4)
 
 Every scheduler event is persisted to the `notification` table **before** delivery (the in-dapp log
@@ -152,3 +194,5 @@ TypeORM migrations (`pnpm --filter txserver migration:run`).
   once-per-grace-window warning dedupe (`1700000000005`).
 - Slice 6: `account`, `channel`, `plan`, `subscription_link` (`1700000000006`) — the off-chain
   platform tables (soft-delete only; metadata, never authoritative).
+- Slice 7: `mutual_consent_proposal` (`1700000000007`) — the relay's proposal log (a proposal
+  stores terms, never raw signed bytes).

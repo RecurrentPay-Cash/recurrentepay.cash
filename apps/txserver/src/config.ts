@@ -20,6 +20,8 @@ export interface AppConfig {
   oracleUrl: string;
   /** Top-up warning buffer as a fraction (e.g. 1.05 = 105%). */
   bufferPercent: number;
+  /** Mutual-consent proposal expiry window, in seconds (default 24h). */
+  proposalExpirySeconds: number;
   /** HTTP port. */
   port: number;
 }
@@ -29,6 +31,8 @@ const DEFAULTS = {
   // The live General Protocols oracle relay. The client appends `/oracleMessages`.
   oracleUrl: 'https://oracles.generalprotocols.com/api/v1',
   bufferPercent: 1.05,
+  // Spec § Mutual-consent relay — a proposal expires after 24h by default.
+  proposalExpirySeconds: 24 * 60 * 60,
   port: 3001,
 } as const;
 
@@ -51,6 +55,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error('config: PORT must be a positive integer');
   }
 
+  const expiryRaw = env.PROPOSAL_EXPIRY_SECONDS;
+  const proposalExpirySeconds =
+    expiryRaw === undefined ? DEFAULTS.proposalExpirySeconds : Number(expiryRaw);
+  if (!Number.isInteger(proposalExpirySeconds) || proposalExpirySeconds <= 0) {
+    throw new Error('config: PROPOSAL_EXPIRY_SECONDS must be a positive integer');
+  }
+
   return {
     databaseUrl,
     electrumUrl: env.ELECTRUM_URL ?? DEFAULTS.electrumUrl,
@@ -59,6 +70,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     serviceKey: env.SERVICE_KEY,
     oracleUrl: env.ORACLE_URL ?? DEFAULTS.oracleUrl,
     bufferPercent,
+    proposalExpirySeconds,
     port,
   };
 }

@@ -6,6 +6,7 @@ import { CreateNotificationWebhook1700000000003 } from './migrations/17000000000
 import { CreateScheduledCancel1700000000004 } from './migrations/1700000000004-create-scheduled-cancel.js';
 import { AddPolicyWarnedAt1700000000005 } from './migrations/1700000000005-add-policy-warned-at.js';
 import { CreateOffchain1700000000006 } from './migrations/1700000000006-create-offchain.js';
+import { CreateMutualConsentProposal1700000000007 } from './migrations/1700000000007-create-mutual-consent-proposal.js';
 import { loadConfig } from '../config.js';
 
 /**
@@ -24,6 +25,7 @@ async function main(): Promise<void> {
       CreateScheduledCancel1700000000004,
       AddPolicyWarnedAt1700000000005,
       CreateOffchain1700000000006,
+      CreateMutualConsentProposal1700000000007,
     ],
   });
   await dataSource.initialize();
