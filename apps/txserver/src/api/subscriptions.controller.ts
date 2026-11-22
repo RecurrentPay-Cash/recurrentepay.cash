@@ -31,6 +31,7 @@ import { NotificationRepository } from '../notifications/notification.repository
 import { ScheduledCancelService } from '../cancel/scheduled-cancel.service.js';
 import { OffchainService } from '../offchain/offchain.service.js';
 import { DiscoveryService } from '../discovery/discovery.service.js';
+import { OracleActionsService } from '../pull/oracle-actions.service.js';
 import { parseId } from './query-id.js';
 
 /** Filtering query (§ Subscription filtering — basic). */
@@ -56,6 +57,7 @@ export class SubscriptionsController {
     private readonly guard: AuthGuard,
     private readonly offchain: OffchainService,
     private readonly discovery: DiscoveryService,
+    private readonly oracleActions: OracleActionsService,
   ) {}
 
   /** The caller's subscriptions, with derived fields and basic filtering. */
@@ -180,6 +182,209 @@ export class SubscriptionsController {
   }
 
   /**
+   * Prepare a **withdraw** for a supporter (spec § Withdraw — oracle-priced). The
+   * server rebuilds the tx against the current outpoints and returns the
+   * **unsigned** hex + the presence input(s) the client must sign. It never
+   * broadcasts an unsigned tx and holds no party key.
+   */
+  @Post(':stateCategory/withdraw/prepare')
+  async prepareWithdraw(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { supporterInput?: RawOracleInput },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireSupporter(stateCategory, pkh);
+    const now = Math.floor(Date.now() / 1000);
+    const built = await this.oracleActions.buildOracleWithdraw(row, {
+      now,
+      supporterInput: parseOracleInput(body?.supporterInput),
+    });
+    return {
+      stateCategory,
+      unsignedHex: built.hex,
+      signableInputs: built.signableInputs,
+      gross: built.gross.toString(),
+      fee: built.fee.toString(),
+      payout: built.payout.toString(),
+      retained: built.retained.toString(),
+    };
+  }
+
+  /** Relay a **client-signed** withdraw tx (verified + broadcast; never re-signs). */
+  @Post(':stateCategory/withdraw/broadcast')
+  async broadcastWithdraw(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { signedHex?: string },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireSupporter(stateCategory, pkh);
+    if (typeof body?.signedHex !== 'string' || body.signedHex === '') {
+      throw new BadRequestException('signedHex is required');
+    }
+    return this.oracleActions.broadcastOracleWithdraw(
+      row,
+      body.signedHex,
+      Math.floor(Date.now() / 1000),
+    );
+  }
+
+  /**
+   * Prepare a **reactivate** for a supporter (spec § Reactivate — oracle-priced,
+   * paused-only). The caller supplies the fresh-funding UTXO(s); the server
+   * returns the unsigned hex + the funding inputs the client must sign.
+   */
+  @Post(':stateCategory/reactivate/prepare')
+  async prepareReactivate(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { fundingInputs?: RawOracleInput[] },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireSupporter(stateCategory, pkh);
+    const fundingInputs = (body?.fundingInputs ?? []).map(parseOracleInput).filter((i) => i !== undefined);
+    if (fundingInputs.length === 0) {
+      throw new BadRequestException('at least one fundingInput is required');
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const built = await this.oracleActions.buildOracleReactivate(row, {
+      now,
+      fundingInputs,
+    });
+    return {
+      stateCategory,
+      unsignedHex: built.hex,
+      signableInputs: built.signableInputs,
+      supporteeAmount: built.supporteeAmount.toString(),
+      fee: built.fee.toString(),
+      newFunds: built.newFunds.toString(),
+    };
+  }
+
+  /** Relay a **client-signed** reactivate tx (verified + broadcast). */
+  @Post(':stateCategory/reactivate/broadcast')
+  async broadcastReactivate(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { signedHex?: string },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireSupporter(stateCategory, pkh);
+    if (typeof body?.signedHex !== 'string' || body.signedHex === '') {
+      throw new BadRequestException('signedHex is required');
+    }
+    const { broadcast: _b, txid } = await this.oracleActions.broadcastOracleReactivate(
+      row,
+      body.signedHex,
+      Math.floor(Date.now() / 1000),
+    );
+    return { stateCategory, txid };
+  }
+
+  /**
+   * Prepare an oracle-key **migrate**. Two paths (spec § Oracle contract):
+   *
+   *   - `mode: 'mutual'` — supporter + supportee both present; prices at the
+   *     CURRENT oracle (a fresh message is required). Returns the unsigned hex +
+   *     the two presence inputs the client signs, then `migrate/broadcast`.
+   *   - `mode: 'service'` — the platform recovery path for a **dead oracle**: no
+   *     oracle message, prices at `lastRate`. The server holds the service key, so
+   *     it builds and broadcasts directly (`oracle-migrate`); `prepare` returns the
+   *     unsigned hex for inspection only.
+   *
+   * Party-scoped: the caller must be a party to the sub.
+   */
+  @Post(':stateCategory/migrate/prepare')
+  async prepareMigrate(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body()
+    body: {
+      newOraclePubkey?: string;
+      mode?: string;
+      supporterInput?: RawOracleInput;
+      counterpartyInput?: RawOracleInput;
+    },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireParty(stateCategory, pkh);
+    if (typeof body?.newOraclePubkey !== 'string' || !/^[0-9a-f]{66}$/i.test(body.newOraclePubkey)) {
+      throw new BadRequestException('newOraclePubkey must be a 33-byte compressed pubkey hex');
+    }
+    const mode = body?.mode === 'service' ? 'service' : body?.mode === 'mutual' ? 'mutual' : undefined;
+    if (mode === undefined) {
+      throw new BadRequestException('mode must be "mutual" or "service"');
+    }
+    const built = await this.oracleActions.buildOracleMigrate(row, {
+      now: Math.floor(Date.now() / 1000),
+      newOraclePubkey: body.newOraclePubkey.toLowerCase(),
+      mode,
+      supporterInput: parseOracleInput(body?.supporterInput),
+      counterpartyInput: parseOracleInput(body?.counterpartyInput),
+    });
+    return {
+      stateCategory,
+      mode,
+      unsignedHex: built.hex,
+      signableInputs: built.signableInputs,
+      newOraclePkHash: built.newOraclePkHash,
+      gross: built.gross.toString(),
+      fee: built.fee.toString(),
+    };
+  }
+
+  /** Relay a **client-signed** mutual migrate tx (verified + broadcast). */
+  @Post(':stateCategory/migrate/broadcast')
+  async broadcastMigrate(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { signedHex?: string },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireParty(stateCategory, pkh);
+    if (typeof body?.signedHex !== 'string' || body.signedHex === '') {
+      throw new BadRequestException('signedHex is required');
+    }
+    const { broadcast: _b, txid } = await this.oracleActions.broadcastOracleMigrate(
+      row,
+      body.signedHex,
+      Math.floor(Date.now() / 1000),
+    );
+    return { stateCategory, txid };
+  }
+
+  /**
+   * **Service-only** oracle migrate — the dead-oracle recovery path. The server
+   * builds and broadcasts directly (it holds the service key) and updates the row
+   * to the new oracle. Party-scoped: the caller must be a party to the sub (the
+   * service is the platform; this is gated to a party for the MVP).
+   */
+  @Post(':stateCategory/oracle-migrate')
+  async oracleMigrate(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+    @Body() body: { newOraclePubkey?: string },
+  ) {
+    const pkh = this.guard.caller(request);
+    const row = await this.requireParty(stateCategory, pkh);
+    if (typeof body?.newOraclePubkey !== 'string' || !/^[0-9a-f]{66}$/i.test(body.newOraclePubkey)) {
+      throw new BadRequestException('newOraclePubkey must be a 33-byte compressed pubkey hex');
+    }
+    const result = await this.oracleActions.executeOracleMigrateService(row, {
+      now: Math.floor(Date.now() / 1000),
+      newOraclePubkey: body.newOraclePubkey.toLowerCase(),
+    });
+    return {
+      stateCategory,
+      txid: result.txid,
+      newOraclePkHash: result.newOraclePkHash,
+      gross: result.gross.toString(),
+      fee: result.fee.toString(),
+    };
+  }
+
+  /**
    * Track a subscription from its genesis transaction (the creation webhook).
    *
    * The creation path must capture the oracle pubkey for an oracle (BCH) sub: the
@@ -223,6 +428,52 @@ export class SubscriptionsController {
     if (row === null) throw new NotFoundException('subscription not found');
     return row;
   }
+
+  /** Load a subscription the caller is the **supporter** of, or throw 404. */
+  private async requireSupporter(stateCategory: string, pkh: string): Promise<Subscription> {
+    const row = await this.requireParty(stateCategory, pkh);
+    if (row.supporterPkh.toLowerCase() !== pkh) {
+      // 404 (not 403) — never reveal existence to a non-supporter.
+      throw new NotFoundException('subscription not found');
+    }
+    return row;
+  }
+}
+
+/** A raw presence/funding input supplied by the client (no key). */
+interface RawOracleInput {
+  txid?: string;
+  vout?: number;
+  satoshis?: string;
+  lockingBytecode?: string;
+}
+
+/** Validate + normalise a caller-supplied input (whitelist; drops any extra field). */
+function parseOracleInput(raw: RawOracleInput | undefined): {
+  txid: string;
+  vout: number;
+  satoshis: bigint;
+  lockingBytecode: string;
+} | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw.txid !== 'string' || !/^[0-9a-f]{64}$/i.test(raw.txid)) {
+    throw new BadRequestException('input txid must be a 64-char hex txid');
+  }
+  if (!Number.isInteger(raw.vout) || (raw.vout ?? -1) < 0) {
+    throw new BadRequestException('input vout must be a non-negative integer');
+  }
+  if (typeof raw.satoshis !== 'string' || !/^\d+$/.test(raw.satoshis)) {
+    throw new BadRequestException('input satoshis must be a decimal string');
+  }
+  if (typeof raw.lockingBytecode !== 'string' || !/^76a914[0-9a-f]{40}88ac$/i.test(raw.lockingBytecode)) {
+    throw new BadRequestException('input lockingBytecode must be a P2PKH lock');
+  }
+  return {
+    txid: raw.txid.toLowerCase(),
+    vout: raw.vout as number,
+    satoshis: BigInt(raw.satoshis),
+    lockingBytecode: raw.lockingBytecode.toLowerCase(),
+  };
 }
 
 /** The API view of a subscription: stored cache + clock-derived fields. */

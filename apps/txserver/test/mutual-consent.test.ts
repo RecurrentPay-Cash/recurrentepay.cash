@@ -602,7 +602,7 @@ describe('MutualConsentService', () => {
     expect(notes.some((n) => n.type === 'proposal_expired')).toBe(true);
   });
 
-  it('refuses an oracle migrate (token path only)', async () => {
+  it('refuses an oracle migrate (handled by OracleActionsService)', async () => {
     const sub = await track({ assetType: 'oracle' });
     await expect(
       relay.propose({
@@ -612,7 +612,7 @@ describe('MutualConsentService', () => {
         terms: { newFundsCategory: 'aa'.repeat(32), newAmount: '10', newAmountNext: '10' },
         now: T,
       }),
-    ).rejects.toThrow(/oracle migrate is not implemented/i);
+    ).rejects.toThrow(/OracleActionsService/i);
   });
 
   it('builds an oracle modify against the oracle artifact (VM-accepted)', async () => {

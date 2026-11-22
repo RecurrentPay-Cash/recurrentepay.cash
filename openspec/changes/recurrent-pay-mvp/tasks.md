@@ -289,6 +289,13 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
   — **Slice 5:** `CancelExecutorService` reads the real service UTXO as the presence input (fails
   loudly when the service address holds nothing); `cancel` authorizes via `isPresent(servicePkh)`.
   Tests: presence input present; VM-accepted cancel with only the service presence.
+  — **Oracle migrate (service-only recovery):** `OracleActionsService.buildOracleMigrate` /
+  `executeOracleMigrateService` — the service presence authorizes a dead-oracle key swap (prices at
+  `lastRate`, no oracle message), builds + broadcasts directly (server holds the service key) and
+  updates the row's `oraclePkHash`/`oraclePubkey`. Mutual migrate (supporter + supportee) prices at
+  the current oracle and returns unsigned presence inputs for the client to sign. Routes:
+  `POST /subscriptions/:id/migrate/prepare|broadcast` (mutual) and
+  `POST /subscriptions/:id/oracle-migrate` (service-only). Tests: `oracle-migrate.test.ts`.
 - [x] 8.13 **Notifications** — all event types (pull/fund/withdraw/reactivate success, paused,
   config change, created/canceled, auto-cancel warning, stray-value); in-dapp + signed webhook with
   retry/backoff + idempotency; persist to the notification log before delivery
@@ -353,8 +360,9 @@ Pre-work disclosure: contracts+contract-tests are the ONLY items done before Nov
   change. `migrate` (token path) consumes the caller-supplied new-category funding input(s)
   (`newAssetInputs`) and sets `newEscrow = totalIn(newCategory)`. Authenticated, party-scoped routes
   (`POST /subscriptions/:id/proposals`, `POST /proposals/:id/sign|revoke`, `GET /proposals/:id`,
-  `GET /subscriptions/:id/proposals`; non-party → 404). **Oracle migrate is a marked TODO** (needs
-  the oracle contract artifact, not in this worktree); the token path is implemented. Tests:
+  `GET /subscriptions/:id/proposals`; non-party → 404). **Oracle migrate is handled by
+  `OracleActionsService`** (oracle-key swap; mutual + service-only recovery); this token-path relay
+  refuses an oracle sub with a clear error. Tests:
   `mutual-consent.test.ts` (lifecycle, rebuild-not-replay via a `setPkh` between propose and sign,
   VM-acceptance against the real token contract for both `modify` and token `migrate`, void/expiry/
   revoke, oracle-migrate refusal, role enforcement), `relay-api.test.ts` (401/404/400, party

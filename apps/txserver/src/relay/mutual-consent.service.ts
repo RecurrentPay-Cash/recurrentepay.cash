@@ -39,10 +39,11 @@
  * service re-checks it (defense in depth) so a direct service call cannot bypass
  * the two-party consent model.
  *
- * **Oracle migrate is out of scope here.** `migrate` on an oracle (BCH) sub swaps
- * the oracle key and needs the oracle contract artifact, which is not in this
- * worktree. `propose` refuses an oracle sub with a clear error; the token path is
- * implemented. See the TODO in `propose`.
+ * **Oracle migrate is handled by `OracleActionsService`.** `migrate` on an oracle
+ * (BCH) sub swaps the oracle key (not the funds category) and is exposed via
+ * `POST /subscriptions/:id/migrate/prepare|broadcast` (mutual) and
+ * `POST /subscriptions/:id/oracle-migrate` (service-only recovery). This
+ * token-path relay refuses it with a clear error.
  */
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { binToHex, decodeTransaction, hexToBin } from '@bitauth/libauth';
@@ -131,9 +132,11 @@ export class MutualConsentService {
    * the sub. `modify` is supporter↔supportee; `migrate` is the same two parties.
    * The service party is never a counterparty (it is the platform).
    *
-   * TODO(oracle-migrate): a `migrate` on an `assetType === 'oracle'` sub swaps the
-   * oracle key and requires the oracle contract artifact (not in this worktree).
-   * It is refused here with a clear error; the token path is implemented.
+   * Oracle (BCH) `migrate` is **not** a token-asset swap: it swaps the oracle key
+   * and is handled by `OracleActionsService.buildOracleMigrate` (mutual) /
+   * `executeOracleMigrateService` (service-only recovery), exposed via
+   * `POST /subscriptions/:id/migrate/prepare|broadcast` and
+   * `POST /subscriptions/:id/oracle-migrate`. This token-path relay refuses it.
    */
   async propose(input: {
     subscription: Subscription;
@@ -144,9 +147,9 @@ export class MutualConsentService {
   }): Promise<ProposalView> {
     const { subscription: sub, callerPkh, kind, terms, now } = input;
     if (kind === 'migrate' && sub.assetType === 'oracle') {
-      // TODO(oracle-migrate): build the oracle-key swap against the oracle
-      // contract artifact. Out of scope for this slice (token path only).
-      throw new Error('relay: oracle migrate is not implemented (token path only)');
+      // Oracle migrate swaps the oracle key (not the funds category) and lives in
+      // `OracleActionsService` — see the doc comment above.
+      throw new Error('relay: oracle migrate is handled by OracleActionsService (token path only here)');
     }
 
     const initiator = await this.accounts.findOrCreateByPkh(callerPkh);

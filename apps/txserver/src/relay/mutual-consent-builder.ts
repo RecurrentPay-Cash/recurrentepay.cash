@@ -160,7 +160,8 @@ export function buildModify(
  * into a new funds category. Both parties present.
  *
  * **Token path only.** The oracle contract's `migrate` (oracle-key swap) is
- * oracle-contract territory and its artifact is not in this worktree — see
+ * oracle-contract territory and is handled by `OracleActionsService`
+ * (`buildOracleMigrate` / `executeOracleMigrateService`) — see
  * `MutualConsentService.propose` for the guard that refuses an oracle sub.
  */
 export function buildMigrate(
@@ -209,12 +210,13 @@ async function buildMutual(
 
   // Oracle (BCH) subs are a single UTXO and use the oracle artifact. Only
   // `modify` is supported here (the oracle `modify(newAmountNext, newPeriodNext)`
-  // signature matches the token one); `migrate` is refused upstream (see
+  // signature matches the token one); `migrate` is an oracle-key swap handled by
+  // `OracleActionsService.buildOracleMigrate` (refused upstream in
   // `MutualConsentService.propose`). Never build a token-script tx against an
   // oracle covenant.
   if (sub.assetType === 'oracle') {
     if (fn !== 'modify') {
-      throw new Error(`${fn}: oracle subs use the oracle artifact (migrate is not supported)`);
+      throw new Error(`${fn}: oracle subs use the oracle artifact (see OracleActionsService.buildOracleMigrate)`);
     }
     return buildOracleModify(provider, sub, options, nextStateOf);
   }

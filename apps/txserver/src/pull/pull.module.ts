@@ -9,7 +9,7 @@
  * otherwise an `ElectrumNetworkProvider` on chipnet. Both implement the
  * CashScript `NetworkProvider` contract, so the executor is provider-agnostic.
  */
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ElectrumNetworkProvider, MockNetworkProvider, type NetworkProvider } from 'cashscript';
@@ -20,12 +20,20 @@ import { OracleModule } from '../oracle/oracle.module.js';
 import { PullRepository } from './pull.repository.js';
 import { PullExecutorService, type PullExecutorConfig } from './pull-executor.service.js';
 import { OraclePullExecutorService } from './oracle-pull-executor.service.js';
+import { OracleActionsService } from './oracle-actions.service.js';
 
 export const PULL_NETWORK_PROVIDER = 'PULL_NETWORK_PROVIDER';
 export const PULL_EXECUTOR_CONFIG = 'PULL_EXECUTOR_CONFIG';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([Pull]), SubscriptionModule, OracleModule],
+  imports: [
+    TypeOrmModule.forFeature([Pull]),
+    SubscriptionModule,
+    OracleModule,
+    // `OracleActionsService` persists the swapped oracle key after a service-only
+    // migrate, so it needs the subscription repository (exported by the module).
+    forwardRef(() => SubscriptionModule),
+  ],
   providers: [
     {
       provide: PULL_NETWORK_PROVIDER,
@@ -49,7 +57,8 @@ export const PULL_EXECUTOR_CONFIG = 'PULL_EXECUTOR_CONFIG';
     PullRepository,
     PullExecutorService,
     OraclePullExecutorService,
+    OracleActionsService,
   ],
-  exports: [PullRepository, PullExecutorService, OraclePullExecutorService],
+  exports: [PullRepository, PullExecutorService, OraclePullExecutorService, OracleActionsService],
 })
 export class PullModule {}
