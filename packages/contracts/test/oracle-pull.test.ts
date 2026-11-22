@@ -114,6 +114,31 @@ describe('pull (oracle, m-period catch-up)', () => {
     expect(sub.state.lastPeriodTime).toBe(T);
   });
 
+  it('single-UTXO balance discipline: extra BCH inputs are not counted as balance', async () => {
+    // The analogue of the token contract's "a stray cannot fake funding": a pull
+    // that carries a large extra BCH input must still settle from the state
+    // input's value only. The covenant's `balance = tx.inputs[stateIdx].value`,
+    // never a transaction-wide sum, so the state output is `stateValue − gross`
+    // and the extra input simply becomes change.
+    const sub = base(); // balance 5,000,000 → one period (2,000,000) coverable
+    sub.advance(DAY);
+    const s = sub.settlement(PRICE);
+    expect(s.gross).toBe(GPP);
+    const args = sub.oracleArgs({ price: Number(PRICE) });
+    const tx = sub.base(() => sub.unlock()['pull']!(args.sig, args.message, args.pubkey));
+    // A large "stray" BCH input, locked to the service, in the same transaction.
+    tx.addInput(sub.input(sub.service, 50_000_000n), sub.service.template.unlockP2PKH());
+    tx.addOutput(sub.plainOutput(sub.supportee, s.paid));
+    tx.addOutput(sub.plainOutput(sub.service, s.fee));
+    // State output is balance − gross, NOT (balance + stray) − gross.
+    tx.addOutput(sub.stateOutput(encodeCommitment({ ...sub.state, ...promote(s), lastRate: s.newLastRate }), sub.balanceAfter(s)));
+    await sub.send(tx.addBchChangeOutputIfNeeded({ to: sub.service.lock, feeRate: 1 }));
+    const after = await sub.readCovenant();
+    // The covenant's balance is `stateValue − gross`; the 50,000,000 stray input
+    // is NOT counted, so the state output is 3,000,000, not 53,000,000.
+    expect(after.sats).toBe(3_000_000n);
+  });
+
   it('terms always replaced on pull', async () => {
     const sub = base({ balance: 10_000_000n });
     sub.advance(DAY - 1);
@@ -144,6 +169,18 @@ describe('pull: oracle message verification', () => {
     const args = sub.oracleArgs({ messageTimestamp: sub.now + 100, price: Number(PRICE) });
     const { message } = await requireError(pullWith(sub, args));
     expect(message).toMatch(/oracle: future-dated message/);
+  });
+
+  it('rejects a message from an earlier period', async () => {
+    const sub = base();
+    // Boundary at T + DAY; pull at T + DAY + 1800 → n = 1, periodStart = T + DAY.
+    // The message timestamp sits in the *previous* period (T + DAY − 1000) yet is
+    // still ≤ tx.locktime and within FRESHNESS, so the ONLY failing check is the
+    // earlier-period bound (`messageTimestamp >= lastPeriodTime + n·period`).
+    sub.now = T + DAY + 1800;
+    const args = sub.oracleArgs({ messageTimestamp: T + DAY - 1000, price: Number(PRICE) });
+    const { message } = await requireError(pullWith(sub, args));
+    expect(message).toMatch(/oracle: message from an earlier period/);
   });
 
   it('rejects a metadata message (contentSequence = 0)', async () => {

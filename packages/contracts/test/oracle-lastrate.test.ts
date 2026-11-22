@@ -6,7 +6,14 @@
  * oracle-priced settle (pull/reactivate/mutual-migrate/withdraw), and read but
  * never written by cancel and service migrate.
  */
-import { MODE_B, DUST, scenario, type Scenario } from './helpers/oracle-harness.js';
+import {
+  MODE_B,
+  DUST,
+  decodeCommitment,
+  encodeCommitment,
+  scenario,
+  type Scenario,
+} from './helpers/oracle-harness.js';
 
 const T = 1_764_000_000;
 const DAY = 86_400;
@@ -25,8 +32,15 @@ const base = (over: Partial<Parameters<typeof scenario>[0]> = {}): Scenario =>
   });
 
 describe('lastRate lifecycle', () => {
-  it('is initialized at creation', () => {
-    expect(base().state.lastRate).toBe(Number(RATE));
+  it('is initialized at creation (builder invariant, not a covenant spend)', () => {
+    // `lastRate` init happens at creation, which is NOT a covenant spend — there
+    // is no `create()` function to gate. The harness seeds the commitment the
+    // builder would produce; assert the committed value round-trips and that the
+    // covenant then reads it back (the `cancel`-before-first-pull path below).
+    const sub = base();
+    expect(sub.state.lastRate).toBe(Number(RATE));
+    const decoded = decodeCommitment(encodeCommitment(sub.state));
+    expect(decoded.lastRate).toBe(Number(RATE));
   });
 
   it('is written by pull', async () => {

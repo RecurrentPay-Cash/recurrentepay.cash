@@ -6,7 +6,7 @@
  * mutual `migrate` and `withdraw` are blocked; `cancel` and service `migrate`
  * succeed because they price at the stored `lastRate`.
  */
-import { MODE_B, encodeCommitment, scenario, type Scenario } from './helpers/oracle-harness.js';
+import { MODE_B, MockOracle, encodeCommitment, scenario, type Scenario } from './helpers/oracle-harness.js';
 import { requireError, succeeds } from './helpers/expect.js';
 
 const T = 1_764_000_000;
@@ -55,6 +55,32 @@ describe('dead-oracle matrix', () => {
     expect(message).toMatch(/oracle: stale message/);
   });
 
+  it('reactivate is blocked (stale message)', async () => {
+    // Paused sub (balance below one period), oracle dead: the reactivate path
+    // verifies the current oracle, so a stale message is rejected before any
+    // payment — reactivate cannot recover a dead oracle.
+    const sub = base({ amount: 500n, balance: 400_000n });
+    sub.now = T + 2 * DAY + 7200;
+    const args = sub.oracleArgs({ messageTimestamp: T + 2 * DAY, price: Number(RATE) });
+    const tx = sub.base(() => sub.unlock()['reactivate']!(args.sig, args.message, args.pubkey));
+    const { message } = await requireError(sub.pay(tx, sub.supporter));
+    expect(message).toMatch(/oracle: stale message/);
+  });
+
+  it('mutual migrate is blocked (stale message)', async () => {
+    // Supporter + supportee present → mutual path, which verifies the current
+    // oracle; a dead oracle blocks it (only the service-only path recovers).
+    const sub = base();
+    sub.now = T + DAY + 7200;
+    const args = sub.oracleArgs({ messageTimestamp: T + DAY, price: Number(RATE) });
+    const next = new MockOracle(0x66);
+    const tx = sub.base(() => sub.unlock()['migrate']!(next.pkHash, args.sig, args.message, args.pubkey));
+    tx.addInput(sub.input(sub.supporter), sub.supporter.template.unlockP2PKH());
+    tx.addInput(sub.input(sub.supportee), sub.supportee.template.unlockP2PKH());
+    const { message } = await requireError(sub.pay(tx, sub.supporter));
+    expect(message).toMatch(/oracle: stale message/);
+  });
+
   it('cancel works with no message (prices at lastRate)', async () => {
     const sub = base();
     sub.advance(DAY);
@@ -65,7 +91,6 @@ describe('dead-oracle matrix', () => {
   it('service migrate works with no fresh message (prices at lastRate)', async () => {
     const sub = base();
     sub.advance(DAY);
-    const { MockOracle } = await import('./helpers/oracle-harness.js');
     expect(await succeeds(sub.migrate(new MockOracle(0x66), RATE, false, sub.service))).toBe(true);
   });
 });
