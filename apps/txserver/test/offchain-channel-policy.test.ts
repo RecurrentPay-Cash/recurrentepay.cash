@@ -45,6 +45,8 @@ import { SubscriptionsController } from '../src/api/subscriptions.controller.js'
 import { DiscoveryService } from '../src/discovery/discovery.service.js';
 import { OracleActionsService } from '../src/pull/oracle-actions.service.js';
 import { TokenActionsService } from '../src/pull/token-actions.service.js';
+import { PullRepository } from '../src/pull/pull.repository.js';
+import { Pull } from '../src/db/pull.entity.js';
 import { NotificationsController } from '../src/api/notifications.controller.js';
 import { WebhooksController } from '../src/api/webhooks.controller.js';
 import { AutoCancelPolicyRepository } from '../src/api/auto-cancel-policy.repository.js';
@@ -106,6 +108,7 @@ describe('Channel-level auto-cancel policy', () => {
         Cancel,
         ScheduledCancel,
         NotificationRead,
+        Pull,
       ],
       synchronize: true,
     });
@@ -162,6 +165,7 @@ describe('Channel-level auto-cancel policy', () => {
         { provide: DiscoveryService, useValue: { discover: async () => ({ tracked: false, reason: 'test' }) } },
         { provide: OracleActionsService, useValue: {} },
         { provide: TokenActionsService, useValue: {} },
+        { provide: PullRepository, useValue: new PullRepository(dataSource.getRepository(Pull)) },
       ],
     }).compile();
 
@@ -187,6 +191,7 @@ describe('Channel-level auto-cancel policy', () => {
       WebhookEndpoint,
       ScheduledCancel,
       NotificationRead,
+      Pull,
     ]) {
       await dataSource.getRepository(entity).clear();
     }

@@ -342,6 +342,42 @@ export class OffchainService {
     return this.links.findSubscriptionIdsByScope(scope);
   }
 
+  /**
+   * Plan/channel context for a batch of subscriptions (dapp-handoff §12).
+   *
+   * The dashboard/detail show the plan title + benefits, which live on the
+   * `plan` row joined via `subscription_link`. Batched to avoid an N+1 read on
+   * the list route. Only **existing** links are returned; a sub with no link
+   * (a scratch sub) is simply absent from the map.
+   */
+  async linkContextFor(
+    subscriptionIds: string[],
+  ): Promise<Map<string, { channelId: number; planId: number | null; planTitle?: string; benefits?: string[] }>> {
+    const context = new Map<
+      string,
+      { channelId: number; planId: number | null; planTitle?: string; benefits?: string[] }
+    >();
+    if (subscriptionIds.length === 0) return context;
+    const links = await this.links.findBySubscriptions(subscriptionIds);
+    for (const link of links) {
+      const entry: {
+        channelId: number;
+        planId: number | null;
+        planTitle?: string;
+        benefits?: string[];
+      } = { channelId: link.channelId, planId: link.planId };
+      if (link.planId !== null) {
+        const plan = await this.plans.findById(link.planId);
+        if (plan !== null) {
+          entry.planTitle = plan.title;
+          if (plan.benefits !== null) entry.benefits = plan.benefits;
+        }
+      }
+      context.set(link.subscriptionId, entry);
+    }
+    return context;
+  }
+
   private async requireOwnChannel(pkh: string): Promise<Channel> {
     const account = await this.accountFor(pkh);
     const channel = await this.channels.findByOwner(account.id);

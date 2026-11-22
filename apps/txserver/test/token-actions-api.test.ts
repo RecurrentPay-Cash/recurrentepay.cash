@@ -44,6 +44,8 @@ import { NotificationReadRepository } from '../src/notifications/notification-re
 import { SubscriptionRepository } from '../src/subscription/subscription.repository.js';
 import { TokenActionsService } from '../src/pull/token-actions.service.js';
 import { OracleActionsService } from '../src/pull/oracle-actions.service.js';
+import { PullRepository } from '../src/pull/pull.repository.js';
+import { Pull } from '../src/db/pull.entity.js';
 import { SubscriptionsController } from '../src/api/subscriptions.controller.js';
 import { AuthController } from '../src/api/auth.controller.js';
 import { ChallengeService } from '../src/auth/challenge.service.js';
@@ -224,6 +226,7 @@ describe('Token actions API', () => {
         SubscriptionLink,
         ChannelAutoCancelPolicy,
         NotificationRead,
+        Pull,
       ],
       synchronize: true,
     });
@@ -278,6 +281,7 @@ describe('Token actions API', () => {
         // The oracle routes are exercised in `oracle-actions-api.test.ts`; this
         // suite only needs the token routes, so the oracle service is a stub.
         { provide: OracleActionsService, useValue: {} },
+        { provide: PullRepository, useValue: new PullRepository(dataSource.getRepository(Pull)) },
         {
           provide: DiscoveryService,
           useValue: { discover: async () => ({ tracked: false, reason: 'test' }) },
@@ -305,6 +309,7 @@ describe('Token actions API', () => {
     await dataSource.getRepository(Channel).clear();
     await dataSource.getRepository(Account).clear();
     await dataSource.getRepository(NotificationRead).clear();
+    await dataSource.getRepository(Pull).clear();
     provider.reset();
 
     broadcastCount = 0;

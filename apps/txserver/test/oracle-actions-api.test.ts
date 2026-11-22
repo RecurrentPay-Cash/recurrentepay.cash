@@ -44,6 +44,8 @@ import { OracleMessageRepository } from '../src/oracle/oracle-message.repository
 import { OracleClientService, type OracleHttpClient } from '../src/oracle/oracle-client.service.js';
 import { OracleActionsService } from '../src/pull/oracle-actions.service.js';
 import { TokenActionsService } from '../src/pull/token-actions.service.js';
+import { PullRepository } from '../src/pull/pull.repository.js';
+import { Pull } from '../src/db/pull.entity.js';
 import { SubscriptionsController } from '../src/api/subscriptions.controller.js';
 import { AuthController } from '../src/api/auth.controller.js';
 import { ChallengeService } from '../src/auth/challenge.service.js';
@@ -261,6 +263,7 @@ describe('Oracle actions API', () => {
         SubscriptionLink,
         ChannelAutoCancelPolicy,
         NotificationRead,
+        Pull,
       ],
       synchronize: true,
     });
@@ -329,6 +332,7 @@ describe('Oracle actions API', () => {
         // The token routes are exercised in `token-actions-api.test.ts`; this
         // suite only needs the oracle routes, so the token service is a stub.
         { provide: TokenActionsService, useValue: {} },
+        { provide: PullRepository, useValue: new PullRepository(dataSource.getRepository(Pull)) },
         {
           provide: DiscoveryService,
           useValue: { discover: async () => ({ tracked: false, reason: 'test' }) },

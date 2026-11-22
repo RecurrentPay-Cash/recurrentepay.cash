@@ -24,6 +24,7 @@ import {
 import { hexToBin } from '@bitauth/libauth';
 import { deriveState, type SubscriptionStatus } from 'shared';
 import { Subscription } from '../db/subscription.entity.js';
+import { Pull } from '../db/pull.entity.js';
 import { SubscriptionRepository } from '../subscription/subscription.repository.js';
 import { AuthGuard, type AuthedRequest } from '../auth/auth.guard.js';
 import { AutoCancelPolicyRepository } from './auto-cancel-policy.repository.js';
@@ -35,6 +36,7 @@ import { OffchainService } from '../offchain/offchain.service.js';
 import { DiscoveryService } from '../discovery/discovery.service.js';
 import { OracleActionsService } from '../pull/oracle-actions.service.js';
 import { TokenActionsService } from '../pull/token-actions.service.js';
+import { PullRepository } from '../pull/pull.repository.js';
 import { parseId } from './query-id.js';
 
 /** Filtering query (§ Subscription filtering — basic). */
@@ -63,6 +65,7 @@ export class SubscriptionsController {
     private readonly discovery: DiscoveryService,
     private readonly oracleActions: OracleActionsService,
     private readonly tokenActions: TokenActionsService,
+    private readonly pulls: PullRepository,
   ) {}
 
   /** The caller's subscriptions, with derived fields and basic filtering. */
@@ -96,6 +99,9 @@ export class SubscriptionsController {
     if (role !== undefined) views = views.filter((v) => v.role === role);
     if (state !== undefined) views = views.filter((v) => v.status === state);
     if (linkedIds !== null) views = views.filter((v) => linkedIds.has(v.stateCategory));
+    // Attach plan/channel context (dapp-handoff §12) — batched, links only.
+    const context = await this.offchain.linkContextFor(views.map((v) => v.stateCategory));
+    views = views.map((v) => withContext(v, context.get(v.stateCategory)));
     return views;
   }
 
@@ -108,10 +114,29 @@ export class SubscriptionsController {
     const pkh = this.guard.caller(request);
     const row = await this.requireParty(stateCategory, pkh);
     const now = Math.floor(Date.now() / 1000);
-    const view = toView(row, pkh, now);
+    let view = toView(row, pkh, now);
     // History: the caller's notification log for this sub (newest first).
     view.history = await this.notifications.findBySubscription(stateCategory, 50);
+    // Plan/channel context (dapp-handoff §12) — links only.
+    const context = await this.offchain.linkContextFor([stateCategory]);
+    view = withContext(view, context.get(stateCategory));
     return view;
+  }
+
+  /**
+   * The caller's pull history for a subscription (dapp-handoff §13), newest
+   * first. Read from the `pull` table; party-scoped (404 for a non-party).
+   * Bigint columns are stored as strings and returned as decimal strings.
+   */
+  @Get(':stateCategory/pulls')
+  async pullsFor(
+    @Req() request: AuthedRequest,
+    @Param('stateCategory') stateCategory: string,
+  ): Promise<PullView[]> {
+    const pkh = this.guard.caller(request);
+    await this.requireParty(stateCategory, pkh);
+    const rows = await this.pulls.findBySubscription(stateCategory);
+    return rows.map(toPullView);
   }
 
   /** The caller's notification log for a subscription. */
@@ -713,6 +738,56 @@ export interface SubscriptionView {
   owedPreSettle: string;
   futurePeriods: string;
   history?: unknown[];
+  /** Plan/channel context (dapp-handoff §12); omitted when the sub has no link. */
+  channelId?: number;
+  planId?: number;
+  planTitle?: string;
+  benefits?: string[];
+}
+
+/** The API view of a pull (dapp-handoff §13). */
+export interface PullView {
+  id: number;
+  txid: string;
+  periodsSettled: string;
+  gross: string;
+  fee: string;
+  broadcastAt: number;
+  status: string;
+}
+
+/**
+ * Project a `pull` row to its API view. Bigint columns are stored as strings in
+ * Postgres but come back as numbers from SQLite — `String(...)` normalises both
+ * to the decimal-string contract the web app expects.
+ */
+export function toPullView(row: Pull): PullView {
+  return {
+    id: row.id,
+    txid: row.txid,
+    periodsSettled: String(row.periodsSettled),
+    gross: String(row.gross),
+    fee: String(row.fee),
+    broadcastAt: row.broadcastAt,
+    status: row.status,
+  };
+}
+
+/** Attach plan/channel context to a view, leaving fields absent when no link. */
+function withContext(
+  view: SubscriptionView,
+  context:
+    | { channelId: number; planId: number | null; planTitle?: string; benefits?: string[] }
+    | undefined,
+): SubscriptionView {
+  if (context === undefined) return view;
+  return {
+    ...view,
+    channelId: context.channelId,
+    planId: context.planId ?? undefined,
+    planTitle: context.planTitle,
+    benefits: context.benefits,
+  };
 }
 
 /** Compute the view for a row, deriving status/arrears/future-periods at `now`. */
